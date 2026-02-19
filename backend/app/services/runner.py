@@ -91,17 +91,31 @@ class RunnerService:
             while iteration < payload.retry_limit and not passed:
                 iteration += 1
 
-                test_result = self.test_engine.run_tests(repo_dir)
-                parsed_failures = self.failure_parser.parse(test_result.output)
-                static_failures = self.static_analyzer.analyze(repo_dir)
+                local_solved = False
+                local_attempts = 0
+                max_local_attempts = 3
+                iteration_rows: list[dict[str, Any]] = []
+                applied_in_iteration = 0
 
-                parsed_failures = self._normalize_failure_paths(parsed_failures, repo_dir)
-                static_failures = self._normalize_failure_paths(static_failures, repo_dir)
-                raw_failures = self._merge_failures(parsed_failures, static_failures)
-                run_state["total_failures_detected"] += len(raw_failures)
+                while local_attempts < max_local_attempts:
+                    local_attempts += 1
 
-                if raw_failures:
+                    test_result = self.test_engine.run_tests(repo_dir)
+                    parsed_failures = self.failure_parser.parse(test_result.output)
+                    static_failures = self.static_analyzer.analyze(repo_dir)
+
+                    parsed_failures = self._normalize_failure_paths(parsed_failures, repo_dir)
+                    static_failures = self._normalize_failure_paths(static_failures, repo_dir)
+                    raw_failures = self._merge_failures(parsed_failures, static_failures)
+                    run_state["total_failures_detected"] += len(raw_failures)
+
+                    if not raw_failures:
+                        local_solved = True
+                        break
+
                     graph_state = self.graph_orchestrator.run(raw_failures)
+                    applied_this_pass = 0
+
                     for fix_result in graph_state["fix_results"]:
                         fix_plan = fix_result["plan"]
                         source_failure = next(
@@ -123,27 +137,42 @@ class RunnerService:
                             message=source_failure.get("message", ""),
                         )
 
-                        commit_message = fix_plan.commit_message
                         if applied:
-                            commit_message = self.github_ops.commit_fix(repo_dir, fix_plan.commit_message)
+                            applied_this_pass += 1
+                            applied_in_iteration += 1
                             run_state["total_fixes_applied"] += 1
-                            run_state["commit_count"] += 1
 
-                        run_state["fixes"].append(
+                        iteration_rows.append(
                             {
                                 "file": fix_plan.file,
                                 "bug_type": fix_plan.bug_type,
                                 "line_number": fix_plan.line_number,
-                                "commit_message": commit_message if applied else "[AI-AGENT] Fix attempt failed",
+                                "commit_message": fix_plan.commit_message if applied else "[AI-AGENT] Fix attempt failed",
                                 "status": "FIXED" if applied else "FAILED",
                                 "expected_output": fix_plan.expected_output,
                             }
                         )
 
+                    if applied_this_pass == 0:
+                        break
+
+                if applied_in_iteration > 0:
+                    committed, final_commit_message = self.github_ops.commit_changes(
+                        repo_path=repo_dir,
+                        commit_message=f"Iteration {iteration}: apply {applied_in_iteration} autonomous fixes",
+                    )
+                    if committed:
+                        run_state["commit_count"] += 1
+                        for row in iteration_rows:
+                            if row["status"] == "FIXED":
+                                row["commit_message"] = final_commit_message
+
+                run_state["fixes"].extend(iteration_rows)
+
                 self.github_ops.push_branch(repo_dir, branch_name)
                 ci_status, workflow_url = await self.github_ops.poll_ci_status(owner, repo, branch_name)
                 run_state["ci_workflow_url"] = workflow_url
-                passed = ci_status == "PASSED"
+                passed = ci_status == "PASSED" and local_solved
                 run_state["timeline"].append(
                     self.timeline_agent.event(
                         iteration=iteration,

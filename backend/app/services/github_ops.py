@@ -64,13 +64,17 @@ class GitHubOpsService:
         return branch_name
 
     def commit_fix(self, repo_path: Path, commit_message: str) -> str:
+        committed, final_message = self.commit_changes(repo_path, commit_message)
+        return final_message
+
+    def commit_changes(self, repo_path: Path, commit_message: str) -> tuple[bool, str]:
         repo = Repo(repo_path)
         final_message = ensure_commit_prefix(commit_message)
         repo.git.add(A=True)
         if not repo.is_dirty(untracked_files=True):
-            return final_message
+            return False, final_message
         repo.index.commit(final_message)
-        return final_message
+        return True, final_message
 
     def push_branch(self, repo_path: Path, branch_name: str) -> None:
         repo = Repo(repo_path)

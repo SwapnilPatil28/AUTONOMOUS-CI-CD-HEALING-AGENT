@@ -12,6 +12,8 @@ class FailureParserService:
         lines = output.splitlines()
 
         lint_pattern = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):\d+:\s*(?P<code>[A-Z]\d+)\s+(?P<msg>.+)$")
+        assertion_pattern = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):\s+AssertionError")
+        pytest_fail_pattern = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):\s+Failed")
         file_line_pattern = re.compile(r"File \"(?P<file>.+?)\", line (?P<line>\d+)")
 
         for line in lines:
@@ -73,6 +75,30 @@ class FailureParserService:
                         "file": fallback[0],
                         "line_number": fallback[1],
                         "bug_type": "TYPE_ERROR",
+                        "message": line.strip(),
+                    }
+                )
+                continue
+
+            assertion_match = assertion_pattern.match(line.strip())
+            if assertion_match:
+                failures.append(
+                    {
+                        "file": assertion_match.group("file"),
+                        "line_number": int(assertion_match.group("line")),
+                        "bug_type": "LOGIC",
+                        "message": line.strip(),
+                    }
+                )
+                continue
+
+            pytest_fail_match = pytest_fail_pattern.match(line.strip())
+            if pytest_fail_match:
+                failures.append(
+                    {
+                        "file": pytest_fail_match.group("file"),
+                        "line_number": int(pytest_fail_match.group("line")),
+                        "bug_type": "LOGIC",
                         "message": line.strip(),
                     }
                 )
