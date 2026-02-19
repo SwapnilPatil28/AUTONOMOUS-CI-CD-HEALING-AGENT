@@ -47,7 +47,11 @@ The dashboard stores and displays exact per-fix output strings in this format:
 ## Tech Stack
 - Frontend: React (functional components + hooks), Context API, Recharts, Vite
 - Backend: FastAPI, LangGraph multi-agent orchestration, SQLite
-- Sandbox/Execution: Docker (`backend/Dockerfile`, `docker-compose.yml`)
+- Sandbox/Execution: **Docker** (`backend/Dockerfile`, `docker-compose.yml`)
+  - ✅ Code execution sandboxed in Docker containers
+  - ✅ Tests run in isolated environment
+  - ✅ Automatic container cleanup
+  - See [SANDBOX_EXECUTION.md](docs/SANDBOX_EXECUTION.md) for details
 
 ## Repository Structure
 - `frontend/` React dashboard (judge-facing interface)

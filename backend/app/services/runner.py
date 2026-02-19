@@ -32,7 +32,7 @@ class RunnerService:
         self.graph_orchestrator = LangGraphOrchestrator()
         self.timeline_agent = TimelineAgent()
         self.github_ops = GitHubOpsService()
-        self.test_engine = TestEngineService()
+        self.test_engine = TestEngineService(use_docker=True)  # ✅ SANDBOXED DOCKER EXECUTION
         self.failure_parser = FailureParserService()
         self.patch_applier = PatchApplierService()
         self.static_analyzer = StaticAnalyzerService()
@@ -81,6 +81,12 @@ class RunnerService:
         repo_dir = self.work_dir / run_id
         passed = False
         iteration = 0
+        
+        # Track unique failures across iterations to avoid counting duplicates
+        unique_failures: set[tuple[str, int, str]] = set()
+        # Track failed attempts per unique failure to prevent infinite retry
+        failed_attempts: dict[tuple[str, int, str], int] = {}
+        max_attempts_per_failure = 3
 
         try:
             owner, repo = self.github_ops.parse_owner_repo(str(payload.repository_url))
@@ -107,7 +113,20 @@ class RunnerService:
                     parsed_failures = self._normalize_failure_paths(parsed_failures, repo_dir)
                     static_failures = self._normalize_failure_paths(static_failures, repo_dir)
                     raw_failures = self._merge_failures(parsed_failures, static_failures)
-                    run_state["total_failures_detected"] += len(raw_failures)
+                    
+                    # Track unique failures across iterations (avoid duplicates)
+                    for failure in raw_failures:
+                        failure_key = (failure["file"], failure["line_number"], failure["bug_type"])
+                        if failure_key not in unique_failures:
+                            unique_failures.add(failure_key)
+                            run_state["total_failures_detected"] += 1
+                    
+                    # Filter out failures that have exceeded max retry attempts
+                    raw_failures = [
+                        f for f in raw_failures
+                        if (f["file"], f["line_number"], f["bug_type"]) not in failed_attempts
+                        or failed_attempts[(f["file"], f["line_number"], f["bug_type"])] < max_attempts_per_failure
+                    ]
 
                     if not raw_failures:
                         local_solved = True
@@ -137,10 +156,17 @@ class RunnerService:
                             message=source_failure.get("message", ""),
                         )
 
+                        failure_key = (fix_plan.file, fix_plan.line_number, fix_plan.bug_type)
+                        
                         if applied:
                             applied_this_pass += 1
                             applied_in_iteration += 1
                             run_state["total_fixes_applied"] += 1
+                        else:
+                            # Track failed attempts to prevent infinite retry
+                            if failure_key not in failed_attempts:
+                                failed_attempts[failure_key] = 0
+                            failed_attempts[failure_key] += 1
 
                         iteration_rows.append(
                             {
@@ -156,6 +182,26 @@ class RunnerService:
                     if applied_this_pass == 0:
                         break
 
+                # Deduplicate iteration_rows to keep only the latest attempt for each failure
+                seen_failures: dict[tuple[str, str, int], dict] = {}
+                for row in iteration_rows:
+                    failure_key = (row["file"], row["bug_type"], row["line_number"])
+                    # Keep the latest attempt (last one in the list)
+                    seen_failures[failure_key] = row
+                
+                # Filter to only keep failures not already in fixes (avoid true duplicates)
+                unique_iteration_rows = []
+                for row in seen_failures.values():
+                    # Check if this failure already exists in run_state["fixes"]
+                    already_exists = any(
+                        f["file"] == row["file"]
+                        and f["bug_type"] == row["bug_type"]
+                        and f["line_number"] == row["line_number"]
+                        for f in run_state["fixes"]
+                    )
+                    if not already_exists:
+                        unique_iteration_rows.append(row)
+
                 if applied_in_iteration > 0:
                     committed, final_commit_message = self.github_ops.commit_changes(
                         repo_path=repo_dir,
@@ -163,13 +209,20 @@ class RunnerService:
                     )
                     if committed:
                         run_state["commit_count"] += 1
-                        for row in iteration_rows:
+                        for row in unique_iteration_rows:
                             if row["status"] == "FIXED":
                                 row["commit_message"] = final_commit_message
 
-                run_state["fixes"].extend(iteration_rows)
+                run_state["fixes"].extend(unique_iteration_rows)
 
-                self.github_ops.push_branch(repo_dir, branch_name)
+                # Push changes with error handling
+                try:
+                    self.github_ops.push_branch(repo_dir, branch_name)
+                except Exception as push_error:
+                    run_state["error_message"] = f"Push failed: {str(push_error)}"
+                    print(f"Push error: {push_error}")
+                    # Don't fail entirely, but mark that we couldn't push
+                    
                 ci_status, workflow_url = await self.github_ops.poll_ci_status(owner, repo, branch_name)
                 run_state["ci_workflow_url"] = workflow_url
                 passed = ci_status == "PASSED" and local_solved
@@ -207,6 +260,10 @@ class RunnerService:
 
         self.storage.upsert_run(run_id, run_state)
         self.storage.write_results_file(run_id, run_state)
+        
+        # ✅ Cleanup Docker containers (sandboxed execution)
+        if self.test_engine.executor:
+            self.test_engine.executor.cleanup_all()
 
     @staticmethod
     def _normalize_failure_paths(failures: list[dict[str, Any]], repo_dir: Path) -> list[dict[str, Any]]:
