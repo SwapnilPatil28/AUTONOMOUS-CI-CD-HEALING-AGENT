@@ -3,8 +3,13 @@ import re
 
 def normalize_name(value: str) -> str:
     upper = value.strip().upper()
-    upper = re.sub(r"[^A-Z0-9\s]", "", upper)
+    # Convert hyphens to underscores first
+    upper = upper.replace("-", "_")
+    # Remove any special characters except underscores and spaces
+    upper = re.sub(r"[^A-Z0-9\s_]", "", upper)
+    # Convert spaces to underscores
     upper = re.sub(r"\s+", "_", upper)
+    # Collapse multiple underscores
     upper = re.sub(r"_+", "_", upper)
     return upper.strip("_")
 

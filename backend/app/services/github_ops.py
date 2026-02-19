@@ -89,7 +89,7 @@ class GitHubOpsService:
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.github_token:
-            headers["Authorization"] = f"Bearer {self.github_token}"
+            headers["Authorization"] = f"token {self.github_token}"
 
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(url, headers=headers, params={"branch": branch_name, "per_page": 10})

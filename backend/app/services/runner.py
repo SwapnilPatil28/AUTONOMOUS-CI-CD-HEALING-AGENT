@@ -82,7 +82,11 @@ class RunnerService:
         passed = False
         iteration = 0
         
-        # Track unique failures across iterations to avoid counting duplicates
+        # Track unique failures and successful fixes across iterations
+        unique_failures: set[tuple] = set()
+        successfully_fixed: set[tuple] = set()  # Fixed failures to avoid retrying
+        failed_attempts: dict[tuple, int] = {}  # Track retry attempts per failure
+        max_attempts_per_failure = 3
         unique_failures: set[tuple[str, int, str]] = set()
         # Track failed attempts per unique failure to prevent infinite retry
         failed_attempts: dict[tuple[str, int, str], int] = {}
@@ -121,26 +125,59 @@ class RunnerService:
                             unique_failures.add(failure_key)
                             run_state["total_failures_detected"] += 1
                     
-                    # Filter out failures that have exceeded max retry attempts
-                    raw_failures = [
-                        f for f in raw_failures
-                        if (f["file"], f["line_number"], f["bug_type"]) not in failed_attempts
-                        or failed_attempts[(f["file"], f["line_number"], f["bug_type"])] < max_attempts_per_failure
-                    ]
-
-                    if not raw_failures:
+                    # Remove failures that have already been fixed in previous iterations
+                    raw_failures_to_fix = []
+                    for f in raw_failures:
+                        failure_key = (f["file"], f["line_number"], f["bug_type"])
+                        # Skip if already successfully fixed before
+                        if failure_key not in successfully_fixed:
+                            raw_failures_to_fix.append(f)
+                    
+                    # If no failures left to fix, we're done
+                    if not raw_failures_to_fix:
                         local_solved = True
                         break
 
-                    graph_state = self.graph_orchestrator.run(raw_failures)
+                    graph_state = self.graph_orchestrator.run(raw_failures_to_fix)
+                    
+                    # Deduplicate fix results by (file, line, bug_type)
+                    # This handles cases where multiple failures on same line (e.g., multi-part imports)
+                    # produce duplicate fix attempts
+                    seen_fixes: dict[tuple[str, int, str], dict] = {}
+                    for fix_result in graph_state["fix_results"]:
+                        fix_plan = fix_result["plan"]
+                        fix_key = (fix_plan.file, fix_plan.line_number, fix_plan.bug_type)
+                        if fix_key not in seen_fixes:
+                            seen_fixes[fix_key] = fix_result
+                    
+                    deduplicated_fixes = list(seen_fixes.values())
+                    
+                    # Group fix results by file and sort descending by line number
+                    # This prevents line number invalidation when removing lines
+                    fixes_by_file: dict[str, list] = {}
+                    for fix_result in deduplicated_fixes:
+                        fix_plan = fix_result["plan"]
+                        if fix_plan.file not in fixes_by_file:
+                            fixes_by_file[fix_plan.file] = []
+                        fixes_by_file[fix_plan.file].append(fix_result)
+                    
+                    # Sort each file's fixes by line number (descending)
+                    for file_fixes in fixes_by_file.values():
+                        file_fixes.sort(key=lambda x: x["plan"].line_number, reverse=True)
+                    
+                    # Flatten back to a single list (grouped by file, sorted within each file)
+                    sorted_fix_results = []
+                    for file_fixes in fixes_by_file.values():
+                        sorted_fix_results.extend(file_fixes)
+                    
                     applied_this_pass = 0
 
-                    for fix_result in graph_state["fix_results"]:
+                    for fix_result in sorted_fix_results:
                         fix_plan = fix_result["plan"]
                         source_failure = next(
                             (
                                 item
-                                for item in raw_failures
+                                for item in raw_failures_to_fix
                                 if item["file"] == fix_plan.file
                                 and item["line_number"] == fix_plan.line_number
                                 and item["bug_type"] == fix_plan.bug_type
@@ -162,6 +199,8 @@ class RunnerService:
                             applied_this_pass += 1
                             applied_in_iteration += 1
                             run_state["total_fixes_applied"] += 1
+                            # Mark as successfully fixed so we don't retry
+                            successfully_fixed.add(failure_key)
                         else:
                             # Track failed attempts to prevent infinite retry
                             if failure_key not in failed_attempts:
