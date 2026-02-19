@@ -30,6 +30,20 @@ def test_all_bug_types():
             "fix_message": "unused import",
         },
         {
+            "name": "LINTING - Partial from-import cleanup",
+            "code": "from typing import List, Dict, Any\n\ndef f(x: List[int], y: Dict[str, int]):\n    return x, y",
+            "bug_type": "LINTING",
+            "should_detect": True,
+            "fix_message": "unused import",
+        },
+        {
+            "name": "LINTING - Partial import cleanup",
+            "code": "import os, json\n\ndef f():\n    return os.getcwd()",
+            "bug_type": "LINTING",
+            "should_detect": True,
+            "fix_message": "unused import",
+        },
+        {
             "name": "LINTING - Unused variable",
             "code": "x = 10\nprint('hello')",
             "bug_type": "LINTING",
@@ -58,6 +72,20 @@ def test_all_bug_types():
             "fix_message": "comparison for max",
         },
         {
+            "name": "LOGIC - Area uses circumference formula",
+            "code": "def calculate_area(radius):\n    pi_val = 3.14159\n    return pi_val * radius * 2",
+            "bug_type": "LOGIC",
+            "should_detect": True,
+            "fix_message": "expected πr²",
+        },
+        {
+            "name": "LOGIC - Min tracker initialized constant",
+            "code": "def find_minimum(numbers):\n    min_val = 0\n    for num in numbers:\n        if num < min_val:\n            min_val = num\n    return min_val",
+            "bug_type": "LOGIC",
+            "should_detect": True,
+            "fix_message": "min/max tracker initialized to constant",
+        },
+        {
             "name": "TYPE_ERROR - int + str",
             "code": 'result = 10\nprint("Result: " + result)',
             "bug_type": "TYPE_ERROR",
@@ -84,6 +112,20 @@ def test_all_bug_types():
             "bug_type": "TYPE_ERROR",
             "should_detect": True,
             "fix_message": "argument type mismatch",
+        },
+        {
+            "name": "TYPE_ERROR - string concat with call",
+            "code": 'def calculate_area(radius):\n    return 3.14 * radius * radius\n\nprint("Area is: " + calculate_area(5))',
+            "bug_type": "TYPE_ERROR",
+            "should_detect": True,
+            "fix_message": "string concatenation with non-string expression",
+        },
+        {
+            "name": "TYPE_ERROR - plus equals mismatch",
+            "code": 'def process_data(data_list):\n    total = "0"\n    for item in data_list:\n        total += item\n    return total',
+            "bug_type": "TYPE_ERROR",
+            "should_detect": True,
+            "fix_message": "type mismatch",
         },
         {
             "name": "IMPORT - Imports after code",

@@ -146,6 +146,7 @@ class StaticAnalyzerService:
         """Find common logic errors: XOR, string literal vs variable, wrong operators."""
         failures: list[dict[str, Any]] = []
         lines = source.splitlines()
+        seen_logic: set[tuple[int, str]] = set()
         
         for line_no, line in enumerate(lines, start=1):
             # Skip comments and empty lines
@@ -189,19 +190,113 @@ class StaticAnalyzerService:
                 left_lower = left_name.lower()
 
                 if "max" in right_lower and operator == "<" and "max" not in left_lower:
-                    failures.append({
-                        "file": relative_path,
-                        "line_number": line_no,
-                        "bug_type": "LOGIC",
-                        "message": "comparison for max uses '<', did you mean '>'?",
-                    })
+                    key = (line_no, "comparison for max uses '<', did you mean '>'?")
+                    if key not in seen_logic:
+                        failures.append({
+                            "file": relative_path,
+                            "line_number": line_no,
+                            "bug_type": "LOGIC",
+                            "message": "comparison for max uses '<', did you mean '>'?",
+                        })
+                        seen_logic.add(key)
                 elif "min" in right_lower and operator == ">" and "min" not in left_lower:
-                    failures.append({
-                        "file": relative_path,
-                        "line_number": line_no,
-                        "bug_type": "LOGIC",
-                        "message": "comparison for min uses '>', did you mean '<'?",
-                    })
+                    key = (line_no, "comparison for min uses '>', did you mean '<'?")
+                    if key not in seen_logic:
+                        failures.append({
+                            "file": relative_path,
+                            "line_number": line_no,
+                            "bug_type": "LOGIC",
+                            "message": "comparison for min uses '>', did you mean '<'?",
+                        })
+                        seen_logic.add(key)
+
+        # AST-assisted logic detection for harder cases
+        try:
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+
+                func_name = node.name.lower()
+                param_names = {arg.arg for arg in node.args.args}
+
+                # Case 1: area-named function likely computing circumference (2*pi*r)
+                if "area" in func_name and param_names:
+                    primary_param = node.args.args[0].arg
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Return):
+                            expr = ast.get_source_segment(source, child.value) or ""
+                            expr_lower = expr.lower()
+                            has_pi = "pi" in expr_lower or "3.14" in expr_lower
+                            if (
+                                has_pi
+                                and "*" in expr
+                                and "**" not in expr
+                                and re.search(rf"\b{re.escape(primary_param)}\b\s*\*\s*2\b", expr)
+                            ):
+                                msg = "area function appears to compute circumference (2πr), expected πr²"
+                                key = (child.lineno, msg)
+                                if key not in seen_logic:
+                                    failures.append({
+                                        "file": relative_path,
+                                        "line_number": child.lineno,
+                                        "bug_type": "LOGIC",
+                                        "message": msg,
+                                    })
+                                    seen_logic.add(key)
+
+                # Case 2: min/max tracker initialized to a constant then compared in loop
+                init_candidates: dict[str, int] = {}
+                for stmt in node.body:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, (int, float))
+                    ):
+                        target_name = stmt.targets[0].id
+                        lower_target = target_name.lower()
+                        if "min" in lower_target or "max" in lower_target:
+                            init_candidates[target_name] = stmt.lineno
+
+                if init_candidates:
+                    for child in ast.walk(node):
+                        if not isinstance(child, ast.If):
+                            continue
+                        if not isinstance(child.test, ast.Compare):
+                            continue
+                        if len(child.test.ops) != 1 or len(child.test.comparators) != 1:
+                            continue
+                        if not isinstance(child.test.left, ast.Name):
+                            continue
+                        comparator = child.test.comparators[0]
+                        if not isinstance(comparator, ast.Name):
+                            continue
+
+                        tracker_name = comparator.id
+                        if tracker_name not in init_candidates:
+                            continue
+
+                        lower_tracker = tracker_name.lower()
+                        op = child.test.ops[0]
+                        is_suspicious_min = "min" in lower_tracker and isinstance(op, ast.Lt)
+                        is_suspicious_max = "max" in lower_tracker and isinstance(op, ast.Gt)
+                        if not (is_suspicious_min or is_suspicious_max):
+                            continue
+
+                        msg = "min/max tracker initialized to constant; use first iterable element instead"
+                        key = (init_candidates[tracker_name], msg)
+                        if key not in seen_logic:
+                            failures.append({
+                                "file": relative_path,
+                                "line_number": init_candidates[tracker_name],
+                                "bug_type": "LOGIC",
+                                "message": msg,
+                            })
+                            seen_logic.add(key)
+        except SyntaxError:
+            pass
         
         return failures
 
@@ -212,6 +307,7 @@ class StaticAnalyzerService:
         lines = source.splitlines()
         variable_types: dict[str, str] = {}  # name -> inferred type
         function_param_types: dict[str, list[str | None]] = {}
+        function_return_types: dict[str, str | None] = {}
         seen_type_errors: set[tuple[int, str]] = set()
 
         def infer_expr_type(node: ast.AST) -> str | None:
@@ -228,6 +324,8 @@ class StaticAnalyzerService:
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id == "str":
                     return "str"
+                if isinstance(node.func, ast.Name) and node.func.id in function_return_types:
+                    return function_return_types[node.func.id]
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {
                     "isoformat", "format", "decode", "strip", "lstrip", "rstrip",
                     "lower", "upper", "title", "capitalize", "replace", "join",
@@ -270,10 +368,18 @@ class StaticAnalyzerService:
                         param_types.append(expected_type)
                     function_param_types[node.name] = param_types
 
+                    return_type: str | None = None
+                    if isinstance(node.returns, ast.Name) and node.returns.id in {"int", "str", "float"}:
+                        return_type = node.returns.id
+                    function_return_types[node.name] = return_type
+
             for node in ast.walk(tree):
                 if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
                     left_type = infer_expr_type(node.left)
                     right_type = infer_expr_type(node.right)
+                    left_is_str_lit = isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
+                    right_is_str_lit = isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)
+
                     if {left_type, right_type} == {"str", "int"}:
                         key = (node.lineno, "type mismatch: cannot add incompatible types")
                         if key not in seen_type_errors:
@@ -284,6 +390,33 @@ class StaticAnalyzerService:
                                 "message": "type mismatch: cannot add incompatible types",
                             })
                             seen_type_errors.add(key)
+                    elif (left_is_str_lit and isinstance(node.right, ast.Call) and right_type != "str") or (
+                        right_is_str_lit and isinstance(node.left, ast.Call) and left_type != "str"
+                    ):
+                        key = (node.lineno, "type mismatch: string concatenation with non-string expression")
+                        if key not in seen_type_errors:
+                            failures.append({
+                                "file": relative_path,
+                                "line_number": node.lineno,
+                                "bug_type": "TYPE_ERROR",
+                                "message": "type mismatch: string concatenation with non-string expression",
+                            })
+                            seen_type_errors.add(key)
+
+                elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add):
+                    if isinstance(node.target, ast.Name):
+                        left_type = variable_types.get(node.target.id)
+                        right_type = infer_expr_type(node.value)
+                        if left_type == "str" and right_type != "str":
+                            key = (node.lineno, "type mismatch: cannot add incompatible types")
+                            if key not in seen_type_errors:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": node.lineno,
+                                    "bug_type": "TYPE_ERROR",
+                                    "message": "type mismatch: cannot add incompatible types",
+                                })
+                                seen_type_errors.add(key)
 
                 elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                     expected_params = function_param_types.get(node.func.id)

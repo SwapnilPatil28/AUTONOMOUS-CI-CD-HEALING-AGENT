@@ -60,44 +60,95 @@ class PatchApplierService:
             or "f401" in msg_lower
             or "unused import" in line_lower
         ):
-            # For multi-part imports, we need to check which names are actually used
-            # and only remove unused ones
-            if "," in original and "from " in original and " import " in original:
-                # Multi-part import: from X import A, B, C
-                # Parse the entire file to determine which names are used
-                try:
-                    source = "\n".join(lines)
-                    tree = ast.parse(source)
-                    
-                    # Find all used names in the file
-                    used_names: set[str] = set()
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                            used_names.add(node.id)
-                    
-                    # Extract import names from this line
-                    import_part = original.split(" import ", 1)[-1]
-                    imported_names = [n.strip() for n in import_part.split(",")]
-                    
-                    # Filter to keep only used names
-                    used_imported = [n for n in imported_names if n in used_names]
-                    
-                    if not used_imported:
-                        # None are used, remove the entire line
-                        lines.pop(index)
-                        return True
-                    elif len(used_imported) < len(imported_names):
-                        # Some are used, rewrite the line
-                        prefix = original.split(" import ", 1)[0]
-                        lines[index] = f"{prefix} import {', '.join(used_imported)}"
-                        return True
-                    # All are used, nothing to fix
-                    return False
-                except:
-                    # If parsing fails, fall back to removing the entire line
-                    pass
-            
-            # Single import or parsing failed - remove the entire line
+            source = "\n".join(lines)
+            code_part, comment_part = self._split_inline_comment(original)
+            stripped = code_part.strip()
+            indentation = original[: len(original) - len(original.lstrip())]
+
+            # Prefer AST-based usage detection; fall back to text occurrence when syntax is broken
+            used_names: set[str] | None = None
+            source_without_comments = "\n".join(line.split("#", 1)[0] for line in lines)
+            try:
+                tree = ast.parse(source)
+                used_names = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                        used_names.add(node.id)
+            except Exception:
+                used_names = None
+
+            def is_binding_used(binding_name: str) -> bool:
+                if used_names is not None:
+                    return binding_name in used_names
+                # Fallback: name appears more than once (import itself + at least one usage)
+                return len(re.findall(rf"\b{re.escape(binding_name)}\b", source_without_comments)) > 1
+
+            # Case 1: from module import A, B as C
+            if stripped.startswith("from ") and " import " in stripped:
+                prefix, import_part = stripped.split(" import ", 1)
+                import_items = [item.strip() for item in import_part.split(",") if item.strip()]
+                kept_items: list[str] = []
+
+                for item in import_items:
+                    alias_match = re.match(
+                        r"^(?P<name>[A-Za-z_]\w*)(?:\s+as\s+(?P<alias>[A-Za-z_]\w*))?$",
+                        item,
+                    )
+                    if not alias_match:
+                        # Preserve unrecognized forms conservatively
+                        kept_items.append(item)
+                        continue
+
+                    bound_name = alias_match.group("alias") or alias_match.group("name")
+                    if is_binding_used(bound_name):
+                        kept_items.append(item)
+
+                if not kept_items:
+                    lines.pop(index)
+                    return True
+
+                new_line = f"{indentation}{prefix} import {', '.join(kept_items)}"
+                if comment_part:
+                    new_line = f"{new_line} {comment_part}"
+                if new_line != original:
+                    lines[index] = new_line
+                    return True
+                return False
+
+            # Case 2: import os, json as js
+            if stripped.startswith("import "):
+                import_part = stripped[len("import "):]
+                import_items = [item.strip() for item in import_part.split(",") if item.strip()]
+                kept_items: list[str] = []
+
+                for item in import_items:
+                    alias_match = re.match(
+                        r"^(?P<module>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?:\s+as\s+(?P<alias>[A-Za-z_]\w*))?$",
+                        item,
+                    )
+                    if not alias_match:
+                        kept_items.append(item)
+                        continue
+
+                    module_name = alias_match.group("module")
+                    alias_name = alias_match.group("alias")
+                    bound_name = alias_name or module_name.split(".")[0]
+                    if is_binding_used(bound_name):
+                        kept_items.append(item)
+
+                if not kept_items:
+                    lines.pop(index)
+                    return True
+
+                new_line = f"{indentation}import {', '.join(kept_items)}"
+                if comment_part:
+                    new_line = f"{new_line} {comment_part}"
+                if new_line != original:
+                    lines[index] = new_line
+                    return True
+                return False
+
+            # Fallback for unusual import formats
             lines.pop(index)
             return True
         
@@ -344,6 +395,20 @@ class PatchApplierService:
         
         if has_type_error_indicator and "+" in original:
             code_part, comment_part = self._split_inline_comment(original)
+
+            # CASE 0: string concatenation with call expression
+            # Example: "Area is: " + calculate_area(5) -> "Area is: " + str(calculate_area(5))
+            plus_call_match = re.search(r'\+\s*([a-zA-Z_]\w*\([^\)]*\))', code_part)
+            if plus_call_match:
+                call_expr = plus_call_match.group(1)
+                before = code_part[:plus_call_match.start(1)]
+                after = code_part[plus_call_match.end(1):]
+                new_code = before + f"str({call_expr})" + after
+                if comment_part:
+                    lines[index] = new_code + " " + comment_part
+                else:
+                    lines[index] = new_code
+                return True
             
             # CASE 1: print(...string... + variable) where variable is int
             # Solution: print(...string... + str(variable))
@@ -394,6 +459,28 @@ class PatchApplierService:
                     lines[index] = new_code
                 return True
 
+        # Fix 2b: += mismatch when lhs was initialized to quoted numeric literal
+        # Example: total = "0" ... total += item  -> total = 0
+        if "type mismatch" in msg_lower and "+=" in original:
+            aug_match = re.match(r'^\s*([a-zA-Z_]\w*)\s*\+=\s*(.+)$', original)
+            if aug_match:
+                lhs = aug_match.group(1)
+                for prev_idx in range(index - 1, -1, -1):
+                    prev_line = lines[prev_idx]
+                    assign_match = re.match(rf'^(?P<indent>\s*){re.escape(lhs)}\s*=\s*["\'](?P<num>\d+)["\']\s*$', prev_line)
+                    if assign_match:
+                        indent = assign_match.group("indent")
+                        num = assign_match.group("num")
+                        lines[prev_idx] = f"{indent}{lhs} = {num}"
+                        return True
+
+                # Fallback: make right-hand expression explicit string conversion
+                rhs = aug_match.group(2).strip()
+                if not rhs.startswith("str("):
+                    indent = original[: len(original) - len(original.lstrip())]
+                    lines[index] = f"{indent}{lhs} += str({rhs})"
+                    return True
+
         # Fix 3: Attribute error - trying to access attribute on wrong type
         if "attribute error" in msg_lower or "has no attribute" in msg_lower:
             # Try to add str() wrapper for attribute access
@@ -433,6 +520,37 @@ class PatchApplierService:
         """Fix logic errors: XOR to exponentiation, string literals, wrong operators, etc."""
         stripped = original.strip()
         msg_lower = message.lower()
+
+        # Fix -1: min/max tracker initialized to constant
+        if "min/max tracker initialized to constant" in msg_lower:
+            assign_match = re.match(r'^(?P<indent>\s*)(?P<name>[a-zA-Z_]\w*)\s*=\s*(?P<value>-?\d+(?:\.\d+)?)\s*$', original)
+            if assign_match:
+                indent = assign_match.group("indent")
+                var_name = assign_match.group("name")
+                # Try to infer iterable from nearest following for-loop
+                for loop_idx in range(index + 1, min(index + 12, len(lines))):
+                    loop_match = re.match(r'^\s*for\s+[a-zA-Z_]\w*\s+in\s+([a-zA-Z_]\w*)\s*:\s*$', lines[loop_idx])
+                    if loop_match:
+                        iterable = loop_match.group(1)
+                        lines[index] = f"{indent}{var_name} = {iterable}[0]"
+                        return True
+
+        # Fix -0: area function formula should use r^2 instead of 2r
+        if "expected πr²" in message or "expected pi*r^2" in msg_lower:
+            code_part, comment_part = self._split_inline_comment(original)
+
+            # Pattern A: ... * radius * 2  -> ... * radius * radius
+            updated = re.sub(r'\b([a-zA-Z_]\w*)\b\s*\*\s*2\b', r'\1 * \1', code_part, count=1)
+            if updated == code_part:
+                # Pattern B: ... * 2 * radius -> ... * radius * radius
+                updated = re.sub(r'\b2\b\s*\*\s*\b([a-zA-Z_]\w*)\b', r'\1 * \1', code_part, count=1)
+
+            if updated != code_part:
+                if comment_part:
+                    lines[index] = f"{updated} {comment_part}"
+                else:
+                    lines[index] = updated
+                return True
 
         # Fix 0: Reversed comparator in max/min tracking
         if "comparison for max uses '<'" in msg_lower and "<" in original:
