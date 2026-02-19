@@ -90,9 +90,17 @@ class GitHubOpsService:
         }
         if self.github_token:
             headers["Authorization"] = f"token {self.github_token}"
+            print(f"[GitHub API] Using authenticated token (last 10 chars: ...{self.github_token[-10:]})")
+        else:
+            print("[GitHub API] WARNING: No GITHUB_TOKEN found - API requests may be rate-limited!")
 
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(url, headers=headers, params={"branch": branch_name, "per_page": 10})
+            if response.status_code == 403:
+                limit_remaining = response.headers.get("X-RateLimit-Remaining", "?")
+                limit_total = response.headers.get("X-RateLimit-Limit", "?")
+                print(f"[GitHub API] 403 Rate limit - Remaining: {limit_remaining}/{limit_total}")
+                print(f"[GitHub API] Response: {response.text[:200]}")
             response.raise_for_status()
             payload = response.json()
 

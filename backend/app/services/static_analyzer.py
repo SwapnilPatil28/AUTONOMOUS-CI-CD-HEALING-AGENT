@@ -611,6 +611,10 @@ class StaticAnalyzerService:
             if not code or "+" not in code:
                 continue
             
+            # Skip if this is a print statement (likely for display, not arithmetic)
+            if code.startswith("print("):
+                continue
+            
             # Don't skip assignments - they can have type errors in their right-hand side
             # e.g., y = x + "20"  is an assignment with a type error in the expression
             
@@ -635,6 +639,10 @@ class StaticAnalyzerService:
                 left_is_call = left.endswith(")") and "(" in left
                 right_is_call = right.endswith(")") and "(" in right
                 
+                # Check if left/right are attribute access (obj.attr)
+                left_is_attr = "." in left
+                right_is_attr = "." in right
+                
                 # Check if expression involves string multiplication (e.g., "=" * 70)
                 # This is safe because string * int = string
                 left_part = parts[i].strip()
@@ -650,14 +658,14 @@ class StaticAnalyzerService:
                 if (left_is_int_lit and right_is_str_lit) or (left_is_str_lit and right_is_int_lit):
                     is_type_error = True
                 
-                # Cases with variables - but exclude function calls and string multiplication
-                # unknown_var + string_literal might be type error
-                elif (not (left_is_str_lit or left_is_int_lit or left_is_str_var or left_is_call)) and right_is_str_lit and not has_string_multiplication:
+                # Cases with variables - but exclude function calls, attribute access, and string multiplication
+                # unknown_var + string_literal might be type error UNLESS unknown_var is an attribute
+                elif (not (left_is_str_lit or left_is_int_lit or left_is_str_var or left_is_call or left_is_attr)) and right_is_str_lit and not has_string_multiplication:
                     # variable + "string" - this is type error if variable isn't a string
                     is_type_error = True
-                # string_literal + unknown_var might be type error
-                elif left_is_str_lit and (not (right_is_str_lit or right_is_int_lit or right_is_str_var or right_is_call)) and not has_string_multiplication:
-                    # "string" + variable
+                # string_literal + unknown_var might be type error UNLESS unknown_var is an attribute
+                elif left_is_str_lit and (not (right_is_str_lit or right_is_int_lit or right_is_str_var or right_is_call or right_is_attr)) and not has_string_multiplication:
+                    # "string" + variable - but NOT "string" + obj.attr
                     is_type_error = True
                 
                 if is_type_error:
