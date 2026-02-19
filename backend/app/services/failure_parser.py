@@ -20,8 +20,6 @@ class FailureParserService:
                 code = lint_match.group("code")
                 msg = lint_match.group("msg")
                 bug_type = "LINTING"
-                if "import" in msg.lower() and code in {"F401", "E402"}:
-                    bug_type = "IMPORT"
                 failures.append(
                     {
                         "file": lint_match.group("file"),

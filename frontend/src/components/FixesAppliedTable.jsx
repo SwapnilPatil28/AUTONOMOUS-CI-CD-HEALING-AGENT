@@ -11,6 +11,7 @@ export default function FixesAppliedTable({ fixes }) {
               <th>File</th>
               <th>Bug Type</th>
               <th>Line Number</th>
+              <th>Expected Dashboard Output</th>
               <th>Commit Message</th>
               <th>Status</th>
             </tr>
@@ -23,6 +24,7 @@ export default function FixesAppliedTable({ fixes }) {
                   <td>{fix.file}</td>
                   <td>{fix.bug_type}</td>
                   <td>{fix.line_number}</td>
+                  <td>{fix.expected_output}</td>
                   <td>{fix.commit_message}</td>
                   <td className={success ? "ok" : "ko"}>{success ? "✓ Fixed" : "✗ Failed"}</td>
                 </tr>
