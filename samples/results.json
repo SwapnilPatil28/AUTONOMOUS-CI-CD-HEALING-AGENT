@@ -1,0 +1,52 @@
+{
+  "run_id": "demo-run-id",
+  "repository_url": "https://github.com/example/project",
+  "team_name": "RIFT ORGANISERS",
+  "team_leader_name": "Saiyam Kumar",
+  "branch_name": "RIFT_ORGANISERS_SAIYAM_KUMAR_AI_Fix",
+  "status": "PASSED",
+  "started_at": "2026-02-19T18:00:00Z",
+  "completed_at": "2026-02-19T18:03:22Z",
+  "duration_seconds": 202,
+  "total_failures_detected": 2,
+  "total_fixes_applied": 2,
+  "commit_count": 2,
+  "score": {
+    "base_score": 100,
+    "speed_bonus": 10,
+    "efficiency_penalty": 0,
+    "final_score": 110
+  },
+  "fixes": [
+    {
+      "file": "src/utils.py",
+      "bug_type": "LINTING",
+      "line_number": 15,
+      "commit_message": "[AI-AGENT] Fix LINTING in src/utils.py:15",
+      "status": "FIXED",
+      "expected_output": "LINTING error in src/utils.py line 15 → Fix: remove the import statement"
+    },
+    {
+      "file": "src/validator.py",
+      "bug_type": "SYNTAX",
+      "line_number": 8,
+      "commit_message": "[AI-AGENT] Fix SYNTAX in src/validator.py:8",
+      "status": "FIXED",
+      "expected_output": "SYNTAX error in src/validator.py line 8 → Fix: add the colon at the correct position"
+    }
+  ],
+  "timeline": [
+    {
+      "iteration": 1,
+      "retry_limit": 5,
+      "status": "FAILED",
+      "timestamp": "2026-02-19T18:01:00Z"
+    },
+    {
+      "iteration": 2,
+      "retry_limit": 5,
+      "status": "PASSED",
+      "timestamp": "2026-02-19T18:03:20Z"
+    }
+  ]
+}
