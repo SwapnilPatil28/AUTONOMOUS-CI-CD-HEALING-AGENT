@@ -254,15 +254,28 @@ class RunnerService:
 
                 run_state["fixes"].extend(unique_iteration_rows)
 
-                # Push changes with error handling
+                # Push changes with error handling (fail fast if push is rejected)
                 try:
                     self.github_ops.push_branch(repo_dir, branch_name)
                 except Exception as push_error:
+                    run_state["status"] = "FAILED"
                     run_state["error_message"] = f"Push failed: {str(push_error)}"
-                    print(f"Push error: {push_error}")
-                    # Don't fail entirely, but mark that we couldn't push
-                    
-                ci_status, workflow_url = await self.github_ops.poll_ci_status(owner, repo, branch_name)
+                    run_state["timeline"].append(
+                        self.timeline_agent.event(
+                            iteration=iteration,
+                            retry_limit=payload.retry_limit,
+                            passed=False,
+                        )
+                    )
+                    self.storage.upsert_run(run_id, run_state)
+                    break
+
+                ci_status, workflow_url = await self.github_ops.poll_ci_status(
+                    owner,
+                    repo,
+                    branch_name,
+                    timeout_seconds=120,
+                )
                 run_state["ci_workflow_url"] = workflow_url
                 passed = ci_status == "PASSED" and local_solved
                 run_state["timeline"].append(

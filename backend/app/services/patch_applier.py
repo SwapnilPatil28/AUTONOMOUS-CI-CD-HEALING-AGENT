@@ -6,6 +6,11 @@ from pathlib import Path
 
 
 class PatchApplierService:
+    @staticmethod
+    def _to_snake_case(name: str) -> str:
+        first_pass = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+        return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", first_pass).lower()
+
     def apply_fix(self, repo_path: Path, file_path: str, line_number: int, bug_type: str, message: str) -> bool:
         target = repo_path / file_path
         if not target.exists() or target.is_dir():
@@ -52,6 +57,55 @@ class PatchApplierService:
         """Fix linting errors: unused imports, unused variables."""
         line_lower = original.lower()
         msg_lower = message.lower()
+
+        # Fix class naming style: class should be PascalCase
+        if "class name should be pascalcase" in msg_lower:
+            match = re.search(r"class name should be PascalCase:\s*['\"]?([a-zA-Z_]\w*)['\"]?", message)
+            if not match:
+                return False
+
+            old_name = match.group(1)
+            parts = [part for part in re.split(r"[_\s]+", old_name) if part]
+            new_name = "".join(part[:1].upper() + part[1:] for part in parts) if parts else (old_name[:1].upper() + old_name[1:])
+            if not new_name or new_name == old_name:
+                return False
+
+            changed_any = False
+            for i in range(len(lines)):
+                updated = re.sub(rf"\b{re.escape(old_name)}\b", new_name, lines[i])
+                if updated != lines[i]:
+                    lines[i] = updated
+                    changed_any = True
+            return changed_any
+
+        # Fix naming style: parameter should be snake_case
+        if "parameter name should be snake_case" in msg_lower:
+            match = re.search(r"parameter name should be snake_case:\s*['\"]?([a-zA-Z_]\w*)['\"]?", message)
+            if not match:
+                return False
+
+            old_name = match.group(1)
+            new_name = self._to_snake_case(old_name)
+            if old_name == new_name:
+                return False
+
+            # Update function signature line
+            updated_signature = re.sub(rf"\b{re.escape(old_name)}\b", new_name, lines[index])
+            if updated_signature == lines[index]:
+                return False
+            lines[index] = updated_signature
+
+            # Update references within function block only
+            def_indent = len(original) - len(original.lstrip())
+            for i in range(index + 1, len(lines)):
+                candidate = lines[i]
+                stripped = candidate.strip()
+                if stripped:
+                    current_indent = len(candidate) - len(candidate.lstrip())
+                    if current_indent <= def_indent and not stripped.startswith(("#", "@")):
+                        break
+                lines[i] = re.sub(rf"\b{re.escape(old_name)}\b", new_name, lines[i])
+            return True
         
         # Fix unused imports
         if self._is_safe_import_line(original) and (
@@ -375,6 +429,39 @@ class PatchApplierService:
         """Fix type errors comprehensively: int+str, missing args, type conversions, etc."""
         msg_lower = message.lower()
 
+        # Fix -1: numeric accumulation incorrectly wraps quantity with str(...)
+        # Example: total = total + str(quantity) when total is numeric
+        if "type mismatch" in msg_lower and "+" in original and "str(" in original:
+            code_part, comment_part = self._split_inline_comment(original)
+            numeric_context_hint = bool(
+                re.search(r'\bget\s*\([^\)]*,\s*-?\d+(?:\.\d+)?\s*\)', code_part)
+                or re.search(r'\b\d+(?:\.\d+)?\s*\+\s*str\(', code_part)
+                or re.search(r'\bstr\([^\)]*\)\s*\+\s*\d+(?:\.\d+)?\b', code_part)
+            )
+            if numeric_context_hint:
+                updated = re.sub(r'\bstr\s*\(\s*([^\)]+?)\s*\)', r'\1', code_part)
+                if updated != code_part:
+                    lines[index] = f"{updated} {comment_part}" if comment_part else updated
+                    return True
+
+        # Fix 0: mixed numeric/string collection literal -> normalize numeric strings
+        if "mixed numeric and string values in collection" in msg_lower and "[" in original and "]" in original:
+            code_part, comment_part = self._split_inline_comment(original)
+
+            bracket_start = code_part.find("[")
+            bracket_end = code_part.rfind("]")
+            if bracket_start != -1 and bracket_end != -1 and bracket_end > bracket_start:
+                inner = code_part[bracket_start + 1:bracket_end]
+
+                # Convert quoted integers/floats to numeric literals; keep non-numeric strings unchanged
+                converted_inner = re.sub(r'"\s*(-?\d+(?:\.\d+)?)\s*"', r'\1', inner)
+                converted_inner = re.sub(r"'\s*(-?\d+(?:\.\d+)?)\s*'", r"\1", converted_inner)
+
+                new_code = code_part[:bracket_start + 1] + converted_inner + code_part[bracket_end:]
+                if new_code != code_part:
+                    lines[index] = f"{new_code} {comment_part}" if comment_part else new_code
+                    return True
+
         # Fix 0: Function argument type mismatch (e.g., add_numbers("5", 10) for int params)
         if "argument type mismatch" in msg_lower and "expected int" in msg_lower and "got str" in msg_lower:
             converted = re.sub(r'([\(,]\s*)["\'](\d+)["\'](\s*[,\)])', r'\1\2\3', original)
@@ -420,6 +507,34 @@ class PatchApplierService:
                 else:
                     lines[index] = new_code
                 return True
+
+            # CASE 0b: string concatenation with attribute call expression
+            # Example: "Total: " + obj.get_total() -> "Total: " + str(obj.get_total())
+            plus_attr_call_match = re.search(r'\+\s*([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+\([^\)]*\))', code_part)
+            if plus_attr_call_match:
+                call_expr = plus_attr_call_match.group(1)
+                before = code_part[:plus_attr_call_match.start(1)]
+                after = code_part[plus_attr_call_match.end(1):]
+                new_code = before + f"str({call_expr})" + after
+                if comment_part:
+                    lines[index] = new_code + " " + comment_part
+                else:
+                    lines[index] = new_code
+                return True
+
+            # CASE 0c: string concatenation with attribute expression
+            # Example: "Balance: " + acc.balance -> "Balance: " + str(acc.balance)
+            plus_attr_match = re.search(r'\+\s*([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w+)+)(?!\s*\()', code_part)
+            if plus_attr_match:
+                attr_expr = plus_attr_match.group(1)
+                before = code_part[:plus_attr_match.start(1)]
+                after = code_part[plus_attr_match.end(1):]
+                new_code = before + f"str({attr_expr})" + after
+                if comment_part:
+                    lines[index] = new_code + " " + comment_part
+                else:
+                    lines[index] = new_code
+                return True
             
             # CASE 1: print(...string... + variable) where variable is int
             # Solution: print(...string... + str(variable))
@@ -427,15 +542,21 @@ class PatchApplierService:
             plus_var_match = re.search(r'\+\s*([a-zA-Z_]\w*)(?:\s*[\)\s]|$)', code_part)
             if plus_var_match:
                 var_name = plus_var_match.group(1)
-                # Replace: + var → + str(var)
-                before = code_part[:plus_var_match.start(1)]
-                after = code_part[plus_var_match.end(1):]
-                new_code = before + f"str({var_name})" + after
-                if comment_part:
-                    lines[index] = new_code + " " + comment_part
+                # Avoid wrapping base object when expression is attribute access/call (e.g., obj.method())
+                if plus_var_match.end(1) < len(code_part) and code_part[plus_var_match.end(1):].lstrip().startswith('.'):
+                    var_name = ""
+                if not var_name:
+                    pass
                 else:
-                    lines[index] = new_code
-                return True
+                # Replace: + var → + str(var)
+                    before = code_part[:plus_var_match.start(1)]
+                    after = code_part[plus_var_match.end(1):]
+                    new_code = before + f"str({var_name})" + after
+                    if comment_part:
+                        lines[index] = new_code + " " + comment_part
+                    else:
+                        lines[index] = new_code
+                    return True
             
             # CASE 2: variable + string_literal where variable might be int
             # Solution: str(var) + string
@@ -563,6 +684,52 @@ class PatchApplierService:
         """Fix logic errors: XOR to exponentiation, string literals, wrong operators, etc."""
         stripped = original.strip()
         msg_lower = message.lower()
+
+        # Fix -3: remove/decrement operation using += instead of -=
+        if "removal operation uses '+='" in msg_lower and "+=" in original:
+            lines[index] = original.replace("+=", "-=", 1)
+            return True
+
+        # Fix -3b: add/deposit operation using -= instead of +=
+        if "addition operation uses '-='" in msg_lower and "-=" in original:
+            lines[index] = original.replace("-=", "+=", 1)
+            return True
+
+        # Fix -3c: return inside accumulation loop (dedent return out of loop)
+        if "return inside accumulation loop causes premature exit" in msg_lower:
+            stripped = original.lstrip()
+            if stripped.startswith("return"):
+                # Find containing for-loop line and use its indentation for return
+                for_idx = None
+                for_indent = 0
+                for prev_idx in range(index - 1, -1, -1):
+                    prev_line = lines[prev_idx]
+                    prev_code = prev_line.split("#", 1)[0].rstrip()
+                    if prev_code.strip().startswith("for ") and prev_code.strip().endswith(":"):
+                        for_idx = prev_idx
+                        for_indent = len(prev_line) - len(prev_line.lstrip())
+                        break
+
+                if for_idx is not None:
+                    lines[index] = (" " * for_indent) + stripped
+                    return True
+
+        # Fix -2: average divides by constant, replace with len(iterable)
+        if "average calculation divides by constant" in msg_lower and "/" in original:
+            iterable_name = None
+            for prev_idx in range(index - 1, -1, -1):
+                prev = lines[prev_idx].split("#", 1)[0].strip()
+                loop_match = re.match(r'^for\s+[a-zA-Z_]\w*\s+in\s+([a-zA-Z_]\w*)\s*:\s*$', prev)
+                if loop_match:
+                    iterable_name = loop_match.group(1)
+                    break
+
+            if iterable_name:
+                code_part, comment_part = self._split_inline_comment(original)
+                updated = re.sub(r'/\s*-?\d+(?:\.\d+)?\b', f'/ len({iterable_name})', code_part, count=1)
+                if updated != code_part:
+                    lines[index] = f"{updated} {comment_part}" if comment_part else updated
+                    return True
 
         # Fix -1: min/max tracker initialized to constant
         if "min/max tracker initialized to constant" in msg_lower:

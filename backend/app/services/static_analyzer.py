@@ -30,6 +30,7 @@ class StaticAnalyzerService:
             if tree:
                 failures.extend(self._find_unused_imports(tree, relative_path))
                 failures.extend(self._find_unused_variables(tree, source, relative_path))
+                failures.extend(self._find_naming_style_issues(tree, relative_path))
             
             # Always check for logic and type errors via regex/pattern matching (doesn't need AST)
             failures.extend(self._find_logic_errors(source, relative_path))
@@ -146,11 +147,71 @@ class StaticAnalyzerService:
         return failures
 
     @staticmethod
+    def _to_snake_case(name: str) -> str:
+        first_pass = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+        return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", first_pass).lower()
+
+    @staticmethod
+    def _find_naming_style_issues(tree: ast.AST, relative_path: str) -> list[dict[str, Any]]:
+        failures: list[dict[str, Any]] = []
+        seen: set[tuple[int, str]] = set()
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                class_name = node.name
+                is_pascal = bool(re.match(r"^[A-Z][A-Za-z0-9]*$", class_name)) and "_" not in class_name
+                if not is_pascal:
+                    suggested = "".join(part.capitalize() for part in re.split(r"[_\s]+", class_name) if part)
+                    if not suggested:
+                        suggested = class_name[:1].upper() + class_name[1:]
+                    key = (node.lineno, class_name)
+                    if key not in seen:
+                        failures.append({
+                            "file": relative_path,
+                            "line_number": node.lineno,
+                            "bug_type": "LINTING",
+                            "message": f"class name should be PascalCase: '{class_name}' -> '{suggested}'",
+                        })
+                        seen.add(key)
+
+            if not isinstance(node, ast.FunctionDef):
+                continue
+
+            for arg in node.args.args:
+                if arg.arg in {"self", "cls"}:
+                    continue
+                if re.match(r"^[a-z_][a-z0-9_]*$", arg.arg):
+                    continue
+
+                suggested = StaticAnalyzerService._to_snake_case(arg.arg)
+                key = (arg.lineno, arg.arg)
+                if key in seen:
+                    continue
+                failures.append({
+                    "file": relative_path,
+                    "line_number": arg.lineno,
+                    "bug_type": "LINTING",
+                    "message": f"parameter name should be snake_case: '{arg.arg}' -> '{suggested}'",
+                })
+                seen.add(key)
+
+        return failures
+
+    @staticmethod
     def _find_logic_errors(source: str, relative_path: str) -> list[dict[str, Any]]:
         """Find common logic errors: XOR, string literal vs variable, wrong operators."""
         failures: list[dict[str, Any]] = []
         lines = source.splitlines()
         seen_logic: set[tuple[int, str]] = set()
+
+        def numeric_literal_value(node: ast.AST) -> float | None:
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return float(node.value)
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+                if isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float)):
+                    value = float(node.operand.value)
+                    return -value if isinstance(node.op, ast.USub) else value
+            return None
         
         for line_no, line in enumerate(lines, start=1):
             # Skip comments and empty lines
@@ -252,12 +313,12 @@ class StaticAnalyzerService:
                 # Case 2: min/max tracker initialized to a constant then compared in loop
                 init_candidates: dict[str, int] = {}
                 for stmt in node.body:
+                    numeric_value = numeric_literal_value(stmt.value) if isinstance(stmt, ast.Assign) else None
                     if (
                         isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
                         and isinstance(stmt.targets[0], ast.Name)
-                        and isinstance(stmt.value, ast.Constant)
-                        and isinstance(stmt.value.value, (int, float))
+                        and numeric_value is not None
                     ):
                         target_name = stmt.targets[0].id
                         lower_target = target_name.lower()
@@ -303,15 +364,15 @@ class StaticAnalyzerService:
                 # Case 3: high/low threshold tracker initialized to restrictive constant
                 threshold_candidates: dict[str, tuple[int, float]] = {}
                 for stmt in node.body:
+                    numeric_value = numeric_literal_value(stmt.value) if isinstance(stmt, ast.Assign) else None
                     if (
                         isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
                         and isinstance(stmt.targets[0], ast.Name)
-                        and isinstance(stmt.value, ast.Constant)
-                        and isinstance(stmt.value.value, (int, float))
+                        and numeric_value is not None
                     ):
                         name = stmt.targets[0].id
-                        value = float(stmt.value.value)
+                        value = float(numeric_value)
                         threshold_candidates[name] = (stmt.lineno, value)
 
                 if threshold_candidates:
@@ -376,18 +437,18 @@ class StaticAnalyzerService:
                                 seen_logic.add(key)
 
                 # Case 4: selection variable assignment likely belongs inside threshold if-block
-                none_initialized: set[str] = set()
+                selector_initialized: set[str] = set()
                 for stmt in node.body:
                     if (
                         isinstance(stmt, ast.Assign)
                         and len(stmt.targets) == 1
                         and isinstance(stmt.targets[0], ast.Name)
                         and isinstance(stmt.value, ast.Constant)
-                        and stmt.value.value is None
                     ):
-                        none_initialized.add(stmt.targets[0].id)
+                        if stmt.value.value is None or stmt.value.value == "":
+                            selector_initialized.add(stmt.targets[0].id)
 
-                if none_initialized:
+                if selector_initialized:
                     for child in ast.walk(node):
                         if not isinstance(child, ast.For):
                             continue
@@ -427,11 +488,23 @@ class StaticAnalyzerService:
                                     isinstance(trailing_stmt, ast.Assign)
                                     and len(trailing_stmt.targets) == 1
                                     and isinstance(trailing_stmt.targets[0], ast.Name)
-                                    and isinstance(trailing_stmt.value, ast.Name)
                                 ):
                                     selected_name = trailing_stmt.targets[0].id
-                                    selected_value = trailing_stmt.value.id
-                                    if selected_name in none_initialized and selected_value == loop_var:
+                                    if selected_name not in selector_initialized:
+                                        continue
+
+                                    selected_from_loop = False
+                                    if isinstance(trailing_stmt.value, ast.Name):
+                                        selected_from_loop = trailing_stmt.value.id == loop_var
+                                    elif isinstance(trailing_stmt.value, ast.Subscript):
+                                        # Supports patterns like selected = arr[i]
+                                        slice_node = trailing_stmt.value.slice
+                                        if isinstance(slice_node, ast.Name):
+                                            selected_from_loop = slice_node.id == loop_var
+                                        elif hasattr(ast, "Index") and isinstance(slice_node, ast.Index) and isinstance(slice_node.value, ast.Name):
+                                            selected_from_loop = slice_node.value.id == loop_var
+
+                                    if selected_from_loop:
                                         msg = "selection update likely belongs inside threshold if-block"
                                         key = (trailing_stmt.lineno, msg)
                                         if key not in seen_logic:
@@ -442,6 +515,144 @@ class StaticAnalyzerService:
                                                 "message": msg,
                                             })
                                             seen_logic.add(key)
+
+                # Case 5: sum accumulator divided by constant (likely average divisor bug)
+                loop_iterable_name: str | None = None
+                loop_item_name: str | None = None
+                accumulator_name: str | None = None
+                accumulator_initialized = False
+
+                for stmt in node.body:
+                    numeric_value = numeric_literal_value(stmt.value) if isinstance(stmt, ast.Assign) else None
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and numeric_value is not None
+                    ):
+                        accumulator_name = stmt.targets[0].id
+                        accumulator_initialized = True
+
+                    if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name) and isinstance(stmt.iter, ast.Name):
+                        loop_item_name = stmt.target.id
+                        loop_iterable_name = stmt.iter.id
+
+                        if accumulator_name:
+                            for inner in stmt.body:
+                                if (
+                                    isinstance(inner, ast.AugAssign)
+                                    and isinstance(inner.op, ast.Add)
+                                    and isinstance(inner.target, ast.Name)
+                                    and isinstance(inner.value, ast.Name)
+                                    and inner.target.id == accumulator_name
+                                    and inner.value.id == loop_item_name
+                                ):
+                                    break
+                            else:
+                                loop_iterable_name = None
+                                loop_item_name = None
+
+                if accumulator_initialized and accumulator_name and loop_iterable_name:
+                    for stmt in node.body:
+                        if not isinstance(stmt, ast.Return) or not isinstance(stmt.value, ast.BinOp):
+                            continue
+                        if not isinstance(stmt.value.op, ast.Div):
+                            continue
+                        if not isinstance(stmt.value.left, ast.Name) or stmt.value.left.id != accumulator_name:
+                            continue
+
+                        right = stmt.value.right
+                        if isinstance(right, ast.Constant) and isinstance(right.value, (int, float)):
+                            # Avoid reporting when divisor is explicitly len(iterable)
+                            msg = "average calculation divides by constant; use len(iterable)"
+                            key = (stmt.lineno, msg)
+                            if key not in seen_logic:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": stmt.lineno,
+                                    "bug_type": "LOGIC",
+                                    "message": msg,
+                                })
+                                seen_logic.add(key)
+
+                # Case 6: remove/decrement operation using += instead of -=
+                remove_hints = {"remove", "decrease", "decrement", "subtract", "deduct", "consume", "reduce"}
+                quantity_hints = {"qty", "quantity", "count", "amount", "num", "number", "delta"}
+                func_name_lower = node.name.lower()
+                is_remove_context = any(hint in func_name_lower for hint in remove_hints)
+                param_names = {arg.arg.lower() for arg in node.args.args}
+                has_quantity_param = any(any(h in p for h in quantity_hints) for p in param_names)
+
+                if is_remove_context and has_quantity_param:
+                    for child in ast.walk(node):
+                        if not isinstance(child, ast.AugAssign) or not isinstance(child.op, ast.Add):
+                            continue
+                        if isinstance(child.value, ast.Name):
+                            value_name_lower = child.value.id.lower()
+                            if any(h in value_name_lower for h in quantity_hints):
+                                msg = "removal operation uses '+='; expected '-='"
+                                key = (child.lineno, msg)
+                                if key not in seen_logic:
+                                    failures.append({
+                                        "file": relative_path,
+                                        "line_number": child.lineno,
+                                        "bug_type": "LOGIC",
+                                        "message": msg,
+                                    })
+                                    seen_logic.add(key)
+
+                # Case 7: deposit/add/increase operation using -= instead of +=
+                add_hints = {"add", "deposit", "increase", "credit", "topup", "top_up", "append"}
+                is_add_context = any(hint in func_name_lower for hint in add_hints)
+                if is_add_context and has_quantity_param:
+                    for child in ast.walk(node):
+                        if not isinstance(child, ast.AugAssign) or not isinstance(child.op, ast.Sub):
+                            continue
+                        if isinstance(child.value, ast.Name):
+                            value_name_lower = child.value.id.lower()
+                            if any(h in value_name_lower for h in quantity_hints):
+                                msg = "addition operation uses '-='; expected '+='"
+                                key = (child.lineno, msg)
+                                if key not in seen_logic:
+                                    failures.append({
+                                        "file": relative_path,
+                                        "line_number": child.lineno,
+                                        "bug_type": "LOGIC",
+                                        "message": msg,
+                                    })
+                                    seen_logic.add(key)
+
+                # Case 8: return inside accumulation loop (premature exit)
+                for child in ast.walk(node):
+                    if not isinstance(child, ast.For):
+                        continue
+
+                    accumulator_names: set[str] = set()
+                    for loop_stmt in child.body:
+                        if (
+                            isinstance(loop_stmt, ast.AugAssign)
+                            and isinstance(loop_stmt.op, ast.Add)
+                            and isinstance(loop_stmt.target, ast.Name)
+                        ):
+                            accumulator_names.add(loop_stmt.target.id)
+
+                    if not accumulator_names:
+                        continue
+
+                    for loop_stmt in child.body:
+                        if not isinstance(loop_stmt, ast.Return):
+                            continue
+                        if isinstance(loop_stmt.value, ast.Name) and loop_stmt.value.id in accumulator_names:
+                            msg = "return inside accumulation loop causes premature exit"
+                            key = (loop_stmt.lineno, msg)
+                            if key not in seen_logic:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": loop_stmt.lineno,
+                                    "bug_type": "LOGIC",
+                                    "message": msg,
+                                })
+                                seen_logic.add(key)
         except SyntaxError:
             pass
         
@@ -463,6 +674,8 @@ class StaticAnalyzerService:
                     return "str"
                 if isinstance(node.value, int):
                     return "int"
+                if isinstance(node.value, float):
+                    return "float"
                 return None
 
             if isinstance(node, ast.Name):
@@ -473,11 +686,17 @@ class StaticAnalyzerService:
                     return "str"
                 if isinstance(node.func, ast.Name) and node.func.id in function_return_types:
                     return function_return_types[node.func.id]
+                if isinstance(node.func, ast.Attribute) and node.func.attr in function_return_types:
+                    return function_return_types[node.func.attr]
                 if isinstance(node.func, ast.Attribute) and node.func.attr in {
                     "isoformat", "format", "decode", "strip", "lstrip", "rstrip",
                     "lower", "upper", "title", "capitalize", "replace", "join",
                 }:
                     return "str"
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "get" and len(node.args) >= 2:
+                    default_type = infer_expr_type(node.args[1])
+                    if default_type:
+                        return default_type
                 return None
 
             if isinstance(node, ast.BinOp):
@@ -489,6 +708,12 @@ class StaticAnalyzerService:
                         return "str"
                 if isinstance(node.op, ast.Add) and left_type and right_type and left_type == right_type:
                     return left_type
+                if isinstance(node.op, ast.Add) and {left_type, right_type} == {"int", "float"}:
+                    return "float"
+                if isinstance(node.op, (ast.Sub, ast.Mult)) and left_type in {"int", "float"} and right_type in {"int", "float"}:
+                    return "float" if "float" in {left_type, right_type} else "int"
+                if isinstance(node.op, ast.Div) and left_type in {"int", "float"} and right_type in {"int", "float"}:
+                    return "float"
 
             return None
 
@@ -504,6 +729,27 @@ class StaticAnalyzerService:
                             if isinstance(target, ast.Name):
                                 variable_types[target.id] = value_type
 
+                    # Detect mixed list literal types (e.g., [32, "38", 28])
+                    if isinstance(node.value, ast.List):
+                        has_num = False
+                        has_str = False
+                        for elt in node.value.elts:
+                            if isinstance(elt, ast.Constant):
+                                if isinstance(elt.value, (int, float)):
+                                    has_num = True
+                                elif isinstance(elt.value, str):
+                                    has_str = True
+                        if has_num and has_str:
+                            key = (node.lineno, "mixed numeric and string values in collection")
+                            if key not in seen_type_errors:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": node.lineno,
+                                    "bug_type": "TYPE_ERROR",
+                                    "message": "mixed numeric and string values in collection",
+                                })
+                                seen_type_errors.add(key)
+
                 elif isinstance(node, ast.FunctionDef):
                     param_types: list[str | None] = []
                     for arg in node.args.args:
@@ -518,6 +764,33 @@ class StaticAnalyzerService:
                     return_type: str | None = None
                     if isinstance(node.returns, ast.Name) and node.returns.id in {"int", "str", "float"}:
                         return_type = node.returns.id
+
+                    # Infer return type when annotation is absent
+                    if return_type is None:
+                        inferred_returns: set[str] = set()
+                        for child in ast.walk(node):
+                            if not isinstance(child, ast.Return) or child.value is None:
+                                continue
+                            if isinstance(child.value, ast.Constant):
+                                if isinstance(child.value.value, str):
+                                    inferred_returns.add("str")
+                                elif isinstance(child.value.value, float):
+                                    inferred_returns.add("float")
+                                elif isinstance(child.value.value, int):
+                                    inferred_returns.add("int")
+                            elif isinstance(child.value, ast.BinOp):
+                                if isinstance(child.value.op, ast.Div):
+                                    inferred_returns.add("float")
+                                elif isinstance(child.value.op, ast.Add):
+                                    expr_type = infer_expr_type(child.value)
+                                    if expr_type in {"int", "float", "str"}:
+                                        inferred_returns.add(expr_type)
+                            elif isinstance(child.value, ast.Call):
+                                if isinstance(child.value.func, ast.Name) and child.value.func.id == "str":
+                                    inferred_returns.add("str")
+
+                        if len(inferred_returns) == 1:
+                            return_type = next(iter(inferred_returns))
                     function_return_types[node.name] = return_type
 
             for node in ast.walk(tree):
@@ -526,8 +799,14 @@ class StaticAnalyzerService:
                     right_type = infer_expr_type(node.right)
                     left_is_str_lit = isinstance(node.left, ast.Constant) and isinstance(node.left.value, str)
                     right_is_str_lit = isinstance(node.right, ast.Constant) and isinstance(node.right.value, str)
+                    numeric_attr_hints = {
+                        "balance", "total", "count", "amount", "qty", "quantity",
+                        "number", "num", "size", "length", "price", "cost", "score",
+                    }
+                    left_is_numeric_attr = isinstance(node.left, ast.Attribute) and node.left.attr.lower() in numeric_attr_hints
+                    right_is_numeric_attr = isinstance(node.right, ast.Attribute) and node.right.attr.lower() in numeric_attr_hints
 
-                    if {left_type, right_type} == {"str", "int"}:
+                    if ({left_type, right_type} == {"str", "int"}) or ({left_type, right_type} == {"str", "float"}):
                         key = (node.lineno, "type mismatch: cannot add incompatible types")
                         if key not in seen_type_errors:
                             failures.append({
@@ -540,6 +819,26 @@ class StaticAnalyzerService:
                     elif (left_is_str_lit and isinstance(node.right, ast.Call) and right_type != "str") or (
                         right_is_str_lit and isinstance(node.left, ast.Call) and left_type != "str"
                     ):
+                        key = (node.lineno, "type mismatch: string concatenation with non-string expression")
+                        if key not in seen_type_errors:
+                            failures.append({
+                                "file": relative_path,
+                                "line_number": node.lineno,
+                                "bug_type": "TYPE_ERROR",
+                                "message": "type mismatch: string concatenation with non-string expression",
+                            })
+                            seen_type_errors.add(key)
+                    elif (left_is_str_lit and right_type in {"int", "float"}) or (right_is_str_lit and left_type in {"int", "float"}):
+                        key = (node.lineno, "type mismatch: string concatenation with non-string expression")
+                        if key not in seen_type_errors:
+                            failures.append({
+                                "file": relative_path,
+                                "line_number": node.lineno,
+                                "bug_type": "TYPE_ERROR",
+                                "message": "type mismatch: string concatenation with non-string expression",
+                            })
+                            seen_type_errors.add(key)
+                    elif (left_is_str_lit and right_is_numeric_attr) or (right_is_str_lit and left_is_numeric_attr):
                         key = (node.lineno, "type mismatch: string concatenation with non-string expression")
                         if key not in seen_type_errors:
                             failures.append({
