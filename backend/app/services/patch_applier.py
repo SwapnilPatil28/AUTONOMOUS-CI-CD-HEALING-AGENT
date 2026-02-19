@@ -136,6 +136,19 @@ class PatchApplierService:
     def _apply_syntax_fix(self, lines: list[str], index: int, original: str, message: str) -> bool:
         """Fix syntax errors comprehensively: missing colons, parentheses, brackets, quotes."""
         code_part, comment_part = self._split_inline_comment(original)
+        msg_lower = message.lower()
+
+        # Fix 0: Parser may report the next line for missing ':'; try previous line first
+        if "expected ':'" in msg_lower and index > 0:
+            prev_original = lines[index - 1]
+            prev_code_part, prev_comment_part = self._split_inline_comment(prev_original)
+            keyword_match = re.search(r"\b(if|elif|else|for|while|def|class|try|except|finally|with)\b", prev_code_part)
+            if keyword_match and not prev_code_part.endswith(":"):
+                if prev_comment_part:
+                    lines[index - 1] = f"{prev_code_part}: {prev_comment_part}"
+                else:
+                    lines[index - 1] = f"{prev_code_part}:"
+                return True
         
         # Fix 1: Add missing colons on function/class/if/for/while/try/except/with statements
         if not code_part or code_part.endswith(":"):
@@ -300,6 +313,13 @@ class PatchApplierService:
         """Fix type errors comprehensively: int+str, missing args, type conversions, etc."""
         msg_lower = message.lower()
 
+        # Fix 0: Function argument type mismatch (e.g., add_numbers("5", 10) for int params)
+        if "argument type mismatch" in msg_lower and "expected int" in msg_lower and "got str" in msg_lower:
+            converted = re.sub(r'([\(,]\s*)["\'](\d+)["\'](\s*[,\)])', r'\1\2\3', original)
+            if converted != original:
+                lines[index] = converted
+                return True
+
         # Fix 1: Missing positional argument
         if "missing" in msg_lower and "required positional argument" in msg_lower:
             if "(" in original and ")" in original:
@@ -413,6 +433,14 @@ class PatchApplierService:
         """Fix logic errors: XOR to exponentiation, string literals, wrong operators, etc."""
         stripped = original.strip()
         msg_lower = message.lower()
+
+        # Fix 0: Reversed comparator in max/min tracking
+        if "comparison for max uses '<'" in msg_lower and "<" in original:
+            lines[index] = original.replace("<", ">", 1)
+            return True
+        if "comparison for min uses '>'" in msg_lower and ">" in original:
+            lines[index] = original.replace(">", "<", 1)
+            return True
 
         # Fix 1: Bitwise XOR (^) that should be exponentiation (**)
         if ("xor" in msg_lower or "exponentiation" in msg_lower or "did you mean" in msg_lower) and "^" in original:

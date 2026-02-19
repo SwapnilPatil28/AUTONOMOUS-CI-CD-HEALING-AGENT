@@ -174,6 +174,34 @@ class StaticAnalyzerService:
                         "bug_type": "LOGIC",
                         "message": "string literal detected in expression, did you mean a variable?",
                     })
+
+            # Detect likely reversed comparison in max/min tracking loops
+            # Example bug: if num < max_value: max_value = num
+            comparison_match = re.search(
+                r'^if\s+([a-zA-Z_]\w*)\s*([<>])\s*([a-zA-Z_]\w*)\s*:\s*$',
+                code,
+            )
+            if comparison_match:
+                left_name = comparison_match.group(1)
+                operator = comparison_match.group(2)
+                right_name = comparison_match.group(3)
+                right_lower = right_name.lower()
+                left_lower = left_name.lower()
+
+                if "max" in right_lower and operator == "<" and "max" not in left_lower:
+                    failures.append({
+                        "file": relative_path,
+                        "line_number": line_no,
+                        "bug_type": "LOGIC",
+                        "message": "comparison for max uses '<', did you mean '>'?",
+                    })
+                elif "min" in right_lower and operator == ">" and "min" not in left_lower:
+                    failures.append({
+                        "file": relative_path,
+                        "line_number": line_no,
+                        "bug_type": "LOGIC",
+                        "message": "comparison for min uses '>', did you mean '<'?",
+                    })
         
         return failures
 
@@ -183,6 +211,106 @@ class StaticAnalyzerService:
         failures: list[dict[str, Any]] = []
         lines = source.splitlines()
         variable_types: dict[str, str] = {}  # name -> inferred type
+        function_param_types: dict[str, list[str | None]] = {}
+        seen_type_errors: set[tuple[int, str]] = set()
+
+        def infer_expr_type(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, str):
+                    return "str"
+                if isinstance(node.value, int):
+                    return "int"
+                return None
+
+            if isinstance(node, ast.Name):
+                return variable_types.get(node.id)
+
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id == "str":
+                    return "str"
+                if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                    "isoformat", "format", "decode", "strip", "lstrip", "rstrip",
+                    "lower", "upper", "title", "capitalize", "replace", "join",
+                }:
+                    return "str"
+                return None
+
+            if isinstance(node, ast.BinOp):
+                left_type = infer_expr_type(node.left)
+                right_type = infer_expr_type(node.right)
+
+                if isinstance(node.op, ast.Mult):
+                    if (left_type == "str" and right_type == "int") or (left_type == "int" and right_type == "str"):
+                        return "str"
+                if isinstance(node.op, ast.Add) and left_type and right_type and left_type == right_type:
+                    return left_type
+
+            return None
+
+        # AST pass for stronger type checking (works when file has valid syntax)
+        try:
+            tree = ast.parse(source)
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    value_type = infer_expr_type(node.value)
+                    if value_type:
+                        for target in node.targets:
+                            if isinstance(target, ast.Name):
+                                variable_types[target.id] = value_type
+
+                elif isinstance(node, ast.FunctionDef):
+                    param_types: list[str | None] = []
+                    for arg in node.args.args:
+                        annotation = arg.annotation
+                        expected_type: str | None = None
+                        if isinstance(annotation, ast.Name):
+                            if annotation.id in {"int", "str"}:
+                                expected_type = annotation.id
+                        param_types.append(expected_type)
+                    function_param_types[node.name] = param_types
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                    left_type = infer_expr_type(node.left)
+                    right_type = infer_expr_type(node.right)
+                    if {left_type, right_type} == {"str", "int"}:
+                        key = (node.lineno, "type mismatch: cannot add incompatible types")
+                        if key not in seen_type_errors:
+                            failures.append({
+                                "file": relative_path,
+                                "line_number": node.lineno,
+                                "bug_type": "TYPE_ERROR",
+                                "message": "type mismatch: cannot add incompatible types",
+                            })
+                            seen_type_errors.add(key)
+
+                elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    expected_params = function_param_types.get(node.func.id)
+                    if not expected_params:
+                        continue
+
+                    for i, arg_node in enumerate(node.args):
+                        if i >= len(expected_params):
+                            break
+                        expected_type = expected_params[i]
+                        if expected_type is None:
+                            continue
+                        actual_type = infer_expr_type(arg_node)
+                        if actual_type and actual_type != expected_type:
+                            msg = f"argument type mismatch: expected {expected_type} but got {actual_type}"
+                            key = (node.lineno, msg)
+                            if key not in seen_type_errors:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": node.lineno,
+                                    "bug_type": "TYPE_ERROR",
+                                    "message": msg,
+                                })
+                                seen_type_errors.add(key)
+
+        except SyntaxError:
+            pass
         
         # First pass: collect all variable type assignments  
         for line_no, line in enumerate(lines, start=1):
@@ -253,12 +381,16 @@ class StaticAnalyzerService:
                     is_type_error = True
                 
                 if is_type_error:
+                    key = (line_no, "type mismatch: cannot add incompatible types")
+                    if key in seen_type_errors:
+                        break
                     failures.append({
                         "file": relative_path,
                         "line_number": line_no,
                         "bug_type": "TYPE_ERROR",
                         "message": "type mismatch: cannot add incompatible types",
                     })
+                    seen_type_errors.add(key)
                     break  # Only report once per line
         
         return failures

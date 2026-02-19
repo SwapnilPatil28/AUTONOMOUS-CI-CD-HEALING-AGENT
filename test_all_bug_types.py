@@ -51,6 +51,13 @@ def test_all_bug_types():
             "fix_message": "string literal",
         },
         {
+            "name": "LOGIC - Reversed max comparison",
+            "code": "max_value = numbers[0]\nfor num in numbers:\n    if num < max_value:\n        max_value = num",
+            "bug_type": "LOGIC",
+            "should_detect": True,
+            "fix_message": "comparison for max",
+        },
+        {
             "name": "TYPE_ERROR - int + str",
             "code": 'result = 10\nprint("Result: " + result)',
             "bug_type": "TYPE_ERROR",
@@ -63,6 +70,20 @@ def test_all_bug_types():
             "bug_type": "TYPE_ERROR",
             "should_detect": True,
             "fix_message": "unsupported operand",
+        },
+        {
+            "name": "TYPE_ERROR - str + int variables",
+            "code": 'def demo():\n    x = "10"\n    y = 5\n    return x + y',
+            "bug_type": "TYPE_ERROR",
+            "should_detect": True,
+            "fix_message": "type mismatch",
+        },
+        {
+            "name": "TYPE_ERROR - function arg mismatch",
+            "code": 'def add_numbers(a: int, b: int) -> int:\n    return a + b\n\nresult = add_numbers("5", 10)',
+            "bug_type": "TYPE_ERROR",
+            "should_detect": True,
+            "fix_message": "argument type mismatch",
         },
         {
             "name": "IMPORT - Imports after code",
