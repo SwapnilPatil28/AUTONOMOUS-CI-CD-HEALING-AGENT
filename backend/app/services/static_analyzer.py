@@ -126,6 +126,10 @@ class StaticAnalyzerService:
             if match:
                 var_name = match.group(1)
                 if not var_name.startswith("_"):
+                    # If AST shows this name is used in any load context, it's not unused
+                    if var_name in used_names:
+                        continue
+
                     # Check if this variable is ever used in the source
                     # Count occurrences after the assignment
                     remaining_source = "\n".join(lines[line_no:])
@@ -295,6 +299,149 @@ class StaticAnalyzerService:
                                 "message": msg,
                             })
                             seen_logic.add(key)
+
+                # Case 3: high/low threshold tracker initialized to restrictive constant
+                threshold_candidates: dict[str, tuple[int, float]] = {}
+                for stmt in node.body:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, (int, float))
+                    ):
+                        name = stmt.targets[0].id
+                        value = float(stmt.value.value)
+                        threshold_candidates[name] = (stmt.lineno, value)
+
+                if threshold_candidates:
+                    high_hints = {"high", "highest", "top", "best", "max", "greatest"}
+                    low_hints = {"low", "lowest", "bottom", "worst", "min", "smallest"}
+
+                    for child in ast.walk(node):
+                        if not isinstance(child, ast.If) or not isinstance(child.test, ast.Compare):
+                            continue
+                        if len(child.test.ops) != 1 or len(child.test.comparators) != 1:
+                            continue
+                        comparator = child.test.comparators[0]
+                        if not isinstance(comparator, ast.Name):
+                            continue
+
+                        tracker = comparator.id
+                        if tracker not in threshold_candidates:
+                            continue
+
+                        tracker_lower = tracker.lower()
+                        op = child.test.ops[0]
+                        init_line, init_value = threshold_candidates[tracker]
+
+                        # Ensure this if-body updates the same tracker
+                        updates_tracker = False
+                        for body_stmt in child.body:
+                            if (
+                                isinstance(body_stmt, ast.Assign)
+                                and len(body_stmt.targets) == 1
+                                and isinstance(body_stmt.targets[0], ast.Name)
+                                and body_stmt.targets[0].id == tracker
+                            ):
+                                updates_tracker = True
+                                break
+                        if not updates_tracker:
+                            continue
+
+                        is_high_tracker = any(h in tracker_lower for h in high_hints)
+                        is_low_tracker = any(h in tracker_lower for h in low_hints)
+
+                        if is_high_tracker and isinstance(op, ast.Gt) and init_value > 0:
+                            msg = "threshold tracker initialized too high for '>' selection"
+                            key = (init_line, msg)
+                            if key not in seen_logic:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": init_line,
+                                    "bug_type": "LOGIC",
+                                    "message": msg,
+                                })
+                                seen_logic.add(key)
+                        elif is_low_tracker and isinstance(op, ast.Lt) and init_value < 0:
+                            msg = "threshold tracker initialized too low for '<' selection"
+                            key = (init_line, msg)
+                            if key not in seen_logic:
+                                failures.append({
+                                    "file": relative_path,
+                                    "line_number": init_line,
+                                    "bug_type": "LOGIC",
+                                    "message": msg,
+                                })
+                                seen_logic.add(key)
+
+                # Case 4: selection variable assignment likely belongs inside threshold if-block
+                none_initialized: set[str] = set()
+                for stmt in node.body:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and isinstance(stmt.value, ast.Constant)
+                        and stmt.value.value is None
+                    ):
+                        none_initialized.add(stmt.targets[0].id)
+
+                if none_initialized:
+                    for child in ast.walk(node):
+                        if not isinstance(child, ast.For):
+                            continue
+                        if not isinstance(child.target, ast.Name):
+                            continue
+
+                        loop_var = child.target.id
+                        for idx, loop_stmt in enumerate(child.body):
+                            if not isinstance(loop_stmt, ast.If):
+                                continue
+                            if not isinstance(loop_stmt.test, ast.Compare):
+                                continue
+                            if len(loop_stmt.test.ops) != 1 or len(loop_stmt.test.comparators) != 1:
+                                continue
+                            if not isinstance(loop_stmt.test.comparators[0], ast.Name):
+                                continue
+
+                            threshold_name = loop_stmt.test.comparators[0].id
+                            if threshold_name not in threshold_candidates:
+                                continue
+
+                            # Ensure if-body updates threshold variable
+                            threshold_updated = any(
+                                isinstance(s, ast.Assign)
+                                and len(s.targets) == 1
+                                and isinstance(s.targets[0], ast.Name)
+                                and s.targets[0].id == threshold_name
+                                for s in loop_stmt.body
+                            )
+                            if not threshold_updated:
+                                continue
+
+                            # Look at subsequent statements in loop body; if they assign selected var = loop_var,
+                            # it's likely intended to be inside the if-block.
+                            for trailing_stmt in child.body[idx + 1:]:
+                                if (
+                                    isinstance(trailing_stmt, ast.Assign)
+                                    and len(trailing_stmt.targets) == 1
+                                    and isinstance(trailing_stmt.targets[0], ast.Name)
+                                    and isinstance(trailing_stmt.value, ast.Name)
+                                ):
+                                    selected_name = trailing_stmt.targets[0].id
+                                    selected_value = trailing_stmt.value.id
+                                    if selected_name in none_initialized and selected_value == loop_var:
+                                        msg = "selection update likely belongs inside threshold if-block"
+                                        key = (trailing_stmt.lineno, msg)
+                                        if key not in seen_logic:
+                                            failures.append({
+                                                "file": relative_path,
+                                                "line_number": trailing_stmt.lineno,
+                                                "bug_type": "LOGIC",
+                                                "message": msg,
+                                            })
+                                            seen_logic.add(key)
         except SyntaxError:
             pass
         
@@ -525,6 +672,42 @@ class StaticAnalyzerService:
                     })
                     seen_type_errors.add(key)
                     break  # Only report once per line
+
+        # Third pass: detect += mismatches from iterables that are populated with str(...)
+        for line_no, line in enumerate(lines, start=1):
+            code = line.split("#", 1)[0].strip()
+            aug_match = re.match(r'^([a-zA-Z_]\w*)\s*\+=\s*([a-zA-Z_]\w*)\s*$', code)
+            if not aug_match:
+                continue
+
+            left_name = aug_match.group(1)
+            right_name = aug_match.group(2)
+            left_type = variable_types.get(left_name)
+            if left_type not in {"int", "float"}:
+                continue
+
+            iterable_name = None
+            for prev_idx in range(line_no - 2, -1, -1):
+                prev_code = lines[prev_idx].split("#", 1)[0].strip()
+                loop_match = re.match(rf'^for\s+{re.escape(right_name)}\s+in\s+([a-zA-Z_][\w\.]*)\s*:\s*$', prev_code)
+                if loop_match:
+                    iterable_name = loop_match.group(1)
+                    break
+
+            if not iterable_name:
+                continue
+
+            append_str_pattern = rf'\b{re.escape(iterable_name)}\s*\.\s*append\s*\(\s*str\s*\('
+            if any(re.search(append_str_pattern, l) for l in lines):
+                key = (line_no, "type mismatch: cannot add incompatible types")
+                if key not in seen_type_errors:
+                    failures.append({
+                        "file": relative_path,
+                        "line_number": line_no,
+                        "bug_type": "TYPE_ERROR",
+                        "message": "type mismatch: cannot add incompatible types",
+                    })
+                    seen_type_errors.add(key)
         
         return failures
 

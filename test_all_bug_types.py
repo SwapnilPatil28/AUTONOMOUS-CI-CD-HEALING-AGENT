@@ -86,6 +86,13 @@ def test_all_bug_types():
             "fix_message": "min/max tracker initialized to constant",
         },
         {
+            "name": "LOGIC - High threshold initialized too high",
+            "code": "def pick_best(items):\n    best = None\n    highest_score = 100\n    for item in items:\n        if item.get_score() > highest_score:\n            highest_score = item.get_score()\n            best = item\n    return best",
+            "bug_type": "LOGIC",
+            "should_detect": True,
+            "fix_message": "threshold tracker initialized too high",
+        },
+        {
             "name": "TYPE_ERROR - int + str",
             "code": 'result = 10\nprint("Result: " + result)',
             "bug_type": "TYPE_ERROR",
@@ -126,6 +133,20 @@ def test_all_bug_types():
             "bug_type": "TYPE_ERROR",
             "should_detect": True,
             "fix_message": "type mismatch",
+        },
+        {
+            "name": "TYPE_ERROR - accumulator from str-appended iterable",
+            "code": 'class C:\n    def __init__(self):\n        self.values = []\n\n    def add(self, value):\n        self.values.append(str(value))\n\n    def total(self):\n        total = 0\n        for v in self.values:\n            total += v\n        return total',
+            "bug_type": "TYPE_ERROR",
+            "should_detect": True,
+            "fix_message": "type mismatch",
+        },
+        {
+            "name": "SYNTAX - Expected indented block after if",
+            "code": "for i in [1, 2]:\n    if i > 1:\n    print(i)",
+            "bug_type": "SYNTAX",
+            "should_detect": True,
+            "fix_message": "expected an indented block",
         },
         {
             "name": "IMPORT - Imports after code",

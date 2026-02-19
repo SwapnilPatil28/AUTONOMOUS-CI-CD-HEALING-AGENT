@@ -189,6 +189,17 @@ class PatchApplierService:
         code_part, comment_part = self._split_inline_comment(original)
         msg_lower = message.lower()
 
+        # Fix 0a: expected indented block (parser may report this as SYNTAX)
+        if "expected an indented block" in msg_lower and index > 0:
+            prev_line = lines[index - 1]
+            prev_code = prev_line.split("#", 1)[0].rstrip() if "#" in prev_line else prev_line.rstrip()
+            if prev_code.strip().endswith(":"):
+                prev_indent = len(prev_line) - len(prev_line.lstrip())
+                expected_indent = prev_indent + 4
+                stripped = original.lstrip()
+                lines[index] = " " * expected_indent + stripped
+                return True
+
         # Fix 0: Parser may report the next line for missing ':'; try previous line first
         if "expected ':'" in msg_lower and index > 0:
             prev_original = lines[index - 1]
@@ -286,7 +297,7 @@ class PatchApplierService:
                     # This line needs indentation
                     lines[index] = " " * expected_indent + stripped
                     return True
-                elif current_indent > 0 and current_indent < expected_indent and current_indent % 4 != 0:
+                elif current_indent < expected_indent:
                     # Fix improper indentation
                     lines[index] = " " * expected_indent + stripped
                     return True
@@ -465,6 +476,31 @@ class PatchApplierService:
             aug_match = re.match(r'^\s*([a-zA-Z_]\w*)\s*\+=\s*(.+)$', original)
             if aug_match:
                 lhs = aug_match.group(1)
+                rhs = aug_match.group(2).strip()
+
+                # If loop source is populated via append(str(...)), remove str at source
+                if re.match(r'^[a-zA-Z_]\w*$', rhs):
+                    iterable_name = None
+                    for prev_idx in range(index - 1, -1, -1):
+                        prev_code = lines[prev_idx].split("#", 1)[0].strip()
+                        loop_match = re.match(rf'^for\s+{re.escape(rhs)}\s+in\s+([a-zA-Z_][\w\.]*)\s*:\s*$', prev_code)
+                        if loop_match:
+                            iterable_name = loop_match.group(1)
+                            break
+
+                    if iterable_name:
+                        append_pattern = re.compile(
+                            rf'^(?P<indent>\s*){re.escape(iterable_name)}\s*\.\s*append\s*\(\s*str\s*\((?P<inner>.+)\)\s*\)\s*$'
+                        )
+                        for source_idx in range(index - 1, -1, -1):
+                            source_line = lines[source_idx]
+                            append_match = append_pattern.match(source_line)
+                            if append_match:
+                                indent = append_match.group("indent")
+                                inner = append_match.group("inner").strip()
+                                lines[source_idx] = f"{indent}{iterable_name}.append({inner})"
+                                return True
+
                 for prev_idx in range(index - 1, -1, -1):
                     prev_line = lines[prev_idx]
                     assign_match = re.match(rf'^(?P<indent>\s*){re.escape(lhs)}\s*=\s*["\'](?P<num>\d+)["\']\s*$', prev_line)
@@ -474,8 +510,15 @@ class PatchApplierService:
                         lines[prev_idx] = f"{indent}{lhs} = {num}"
                         return True
 
+                    # If lhs is numeric accumulator, coerce rhs to int
+                    numeric_assign = re.match(rf'^(?P<indent>\s*){re.escape(lhs)}\s*=\s*(?P<num>\d+)\s*$', prev_line)
+                    if numeric_assign:
+                        indent = original[: len(original) - len(original.lstrip())]
+                        if not rhs.startswith("int("):
+                            lines[index] = f"{indent}{lhs} += int({rhs})"
+                            return True
+
                 # Fallback: make right-hand expression explicit string conversion
-                rhs = aug_match.group(2).strip()
                 if not rhs.startswith("str("):
                     indent = original[: len(original) - len(original.lstrip())]
                     lines[index] = f"{indent}{lhs} += str({rhs})"
@@ -534,6 +577,39 @@ class PatchApplierService:
                         iterable = loop_match.group(1)
                         lines[index] = f"{indent}{var_name} = {iterable}[0]"
                         return True
+
+        # Fix -1b: threshold tracker initialized too high/low for selection comparator
+        if "threshold tracker initialized too high" in msg_lower:
+            assign_match = re.match(r'^(?P<indent>\s*)(?P<name>[a-zA-Z_]\w*)\s*=\s*-?\d+(?:\.\d+)?\s*$', original)
+            if assign_match:
+                indent = assign_match.group("indent")
+                var_name = assign_match.group("name")
+                lines[index] = f"{indent}{var_name} = float('-inf')"
+                return True
+
+        if "threshold tracker initialized too low" in msg_lower:
+            assign_match = re.match(r'^(?P<indent>\s*)(?P<name>[a-zA-Z_]\w*)\s*=\s*-?\d+(?:\.\d+)?\s*$', original)
+            if assign_match:
+                indent = assign_match.group("indent")
+                var_name = assign_match.group("name")
+                lines[index] = f"{indent}{var_name} = float('inf')"
+                return True
+
+        # Fix -1c: candidate selection assignment should be inside threshold if-block
+        if "selection update likely belongs inside threshold if-block" in msg_lower and index > 0:
+            current_indent = len(original) - len(original.lstrip())
+
+            # Find nearest previous if-line and indent relative to it
+            for prev_idx in range(index - 1, -1, -1):
+                prev_code = lines[prev_idx].split("#", 1)[0].rstrip()
+                if prev_code.strip().startswith("if ") and prev_code.strip().endswith(":"):
+                    if_indent = len(lines[prev_idx]) - len(lines[prev_idx].lstrip())
+                    expected_indent = if_indent + 4
+                    if current_indent <= if_indent:
+                        stripped = original.lstrip()
+                        lines[index] = " " * expected_indent + stripped
+                        return True
+                    break
 
         # Fix -0: area function formula should use r^2 instead of 2r
         if "expected πr²" in message or "expected pi*r^2" in msg_lower:
