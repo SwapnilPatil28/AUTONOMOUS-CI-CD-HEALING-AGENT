@@ -5,7 +5,7 @@ export default function FixesAppliedTable({ fixes }) {
     <section className="card">
       <h2>Fixes Applied Table</h2>
       <div className="table-wrap">
-        <table>
+        <table className="fixes-table">
           <thead>
             <tr>
               <th>File</th>

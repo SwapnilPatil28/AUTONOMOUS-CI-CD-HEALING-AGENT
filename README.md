@@ -1,66 +1,98 @@
 # Autonomous CI/CD Healing Agent
 
-RIFT 2026 Hackathon submission for the AI/ML + DevOps Automation + Agentic Systems track.
+A full-stack autonomous repair system that:
+- accepts a GitHub repository URL,
+- discovers and classifies failures,
+- applies targeted fixes across multiple languages,
+- commits/pushes fixes to a policy-compliant branch,
+- polls GitHub Actions status,
+- and returns a complete run report to a React dashboard.
 
-## Live Deployment URL
-- Frontend: `ADD_YOUR_DEPLOYED_FRONTEND_URL`
+## What this project includes
 
-## LinkedIn Demo Video URL
-- `ADD_YOUR_LINKEDIN_VIDEO_URL` (must tag @RIFT2026 and remain public)
+- **Backend API** (`FastAPI`) for run lifecycle management
+- **Agent orchestration** (`LangGraph`) for classify → generate → verify flow
+- **Static + parser-based failure detection**
+- **Automatic patch application** for:
+	- Python (`.py`)
+	- Java (`.java`)
+	- JavaScript (`.js`)
+	- TypeScript (`.ts`)
+- **Sandboxed test execution** via Docker (with fallback if Docker unavailable)
+- **Frontend dashboard** (`React + Vite + Recharts`) with:
+	- Input Section
+	- Run Summary Card
+	- Score Breakdown Panel
+	- Fixes Applied Table
+	- CI/CD Status Timeline
 
-## Project Architecture Diagram
-- See `docs/ARCHITECTURE.md`
+## Repository structure
 
-## Team Members
-- Team Name: `ADD_TEAM_NAME`
-- Team Leader: `ADD_TEAM_LEADER_NAME`
-- Members: `ADD_MEMBER_NAMES`
+```text
+.
+├─ backend/
+│  ├─ app/
+│  │  ├─ agents/        # LangGraph flow + agent stages
+│  │  ├─ core/          # policy + scoring
+│  │  ├─ models/        # API schemas
+│  │  └─ services/      # runner, analyzers, patchers, git ops, storage, test engine
+│  ├─ data/             # runtime outputs (ignored by git)
+│  ├─ workspaces/       # cloned target repos per run (ignored by git)
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ frontend/
+│  ├─ src/
+│  │  ├─ components/
+│  │  ├─ context/
+│  │  └─ utils/
+│  ├─ package.json
+│  └─ vite.config.js
+├─ docs/
+│  ├─ ARCHITECTURE.md
+│  ├─ API.md
+│  ├─ DEVELOPMENT.md
+│  └─ SANDBOX_EXECUTION.md
+├─ samples/
+│  └─ results.json
+└─ docker-compose.yml
+```
 
-## Core Features
-- Accepts GitHub repository URL, team name, and leader name from React dashboard.
-- Creates strict branch name format: `TEAM_NAME_LEADER_NAME_AI_Fix`.
-- Detects failures, classifies bug types, generates targeted fixes, and commits with `[AI-AGENT]` prefix.
-- Monitors CI/CD timeline with iteration status and timestamps.
-- Generates `results.json` at the end of each run.
+## Prerequisites
 
-## Mandatory Bug Types Supported
-- `LINTING`
-- `SYNTAX`
-- `LOGIC`
-- `TYPE_ERROR`
-- `IMPORT`
-- `INDENTATION`
+- **Python 3.11+** (3.12 recommended)
+- **Node.js 20+**
+- **Docker Desktop / Docker Engine** (recommended for sandboxed execution)
+- A **GitHub Personal Access Token** with repository push and Actions-read capability for target repos
 
-## Required Dashboard Sections Implemented
-1. Input Section
-2. Run Summary Card
-3. Score Breakdown Panel
-4. Fixes Applied Table
-5. CI/CD Status Timeline
+## Environment configuration
 
-## Exact Test Case Output Format
-The dashboard stores and displays exact per-fix output strings in this format:
+### Backend (`backend/.env`)
 
-- `LINTING error in src/utils.py line 15 → Fix: remove the import statement`
-- `SYNTAX error in src/validator.py line 8 → Fix: add the colon at the correct position`
+Copy `backend/.env.example` to `backend/.env` and set values:
 
-## Tech Stack
-- Frontend: React (functional components + hooks), Context API, Recharts, Vite
-- Backend: FastAPI, LangGraph multi-agent orchestration, SQLite
-- Sandbox/Execution: **Docker** (`backend/Dockerfile`, `docker-compose.yml`)
-  - ✅ Code execution sandboxed in Docker containers
-  - ✅ Tests run in isolated environment
-  - ✅ Automatic container cleanup
-  - See [SANDBOX_EXECUTION.md](docs/SANDBOX_EXECUTION.md) for details
+```env
+GITHUB_TOKEN=ghp_xxx
+GITHUB_OWNER=owner
+GITHUB_REPO=repo
+DEFAULT_RETRY_LIMIT=5
+```
 
-## Repository Structure
-- `frontend/` React dashboard (judge-facing interface)
-- `backend/` FastAPI + LangGraph agent engine
-- `docs/` architecture and design assets
-- `samples/` sample `results.json`
+Notes:
+- `GITHUB_TOKEN` is the critical value for cloning/pushing and workflow polling.
+- `GITHUB_OWNER` / `GITHUB_REPO` are optional metadata in current code paths.
 
-## Setup Instructions
-### 1) Backend
+### Frontend (`frontend/.env`)
+
+Copy `frontend/.env.example` to `frontend/.env`:
+
+```env
+VITE_API_BASE=http://127.0.0.1:8000
+```
+
+## Run locally
+
+### 1) Start backend
+
 ```bash
 cd backend
 python -m venv .venv
@@ -70,65 +102,141 @@ copy .env.example .env
 uvicorn app.main:app --port 8000
 ```
 
-Set required backend env in `.env`:
-- `GITHUB_TOKEN` (Personal Access Token with repo + workflow access)
-- `GITHUB_OWNER` and `GITHUB_REPO` (optional metadata)
-- `DEFAULT_RETRY_LIMIT` (optional)
+### 2) Start frontend
 
-### 2) Frontend
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend runs at `http://localhost:5173` and backend runs at `http://localhost:8000`.
+- Frontend: `http://localhost:5173`
+- Backend: `http://127.0.0.1:8000`
 
-Do not run backend with `--reload` during autonomous runs, because file edits in `backend/workspaces` can trigger process restarts.
+## Run with Docker Compose
 
-## Docker Run (Recommended)
 ```bash
 docker compose up --build
 ```
 
-## API Usage Example
-### Start run
-`POST /api/runs`
+Services:
+- Backend on `:8000`
+- Frontend on `:5173`
+
+## API endpoints
+
+### `GET /health`
+Returns service liveness.
+
+### `POST /api/runs`
+Creates and starts a new run.
 
 Request body:
 ```json
 {
-	"repository_url": "https://github.com/example/project",
-	"team_name": "RIFT ORGANISERS",
-	"team_leader_name": "Saiyam Kumar",
+	"repository_url": "https://github.com/owner/repo",
+	"team_name": "My Team",
+	"team_leader_name": "Leader",
 	"retry_limit": 5
 }
 ```
 
-### Get run details
-`GET /api/runs/{run_id}`
+### `GET /api/runs/{run_id}`
+Returns full run state including summary, score, fixes, timeline, and errors.
 
-## Scoring Logic
+### `POST /api/runs/{run_id}/resume`
+Resumes execution for an existing run with a new request payload.
+
+See [docs/API.md](docs/API.md) for full payload schemas.
+
+## Runtime behavior and policy
+
+### Branch naming policy
+Generated by `backend/app/core/policy.py`:
+
+```text
+TEAM_NAME_LEADER_NAME_AI_Fix
+```
+
+Rules:
+- uppercase normalization,
+- spaces and hyphens converted to underscores,
+- special characters removed,
+- multiple underscores collapsed.
+
+### Commit message policy
+- All commits are enforced to start with `[AI-AGENT]`.
+- Runner refuses to push directly to `main`.
+
+### Retry and timeline
+- `retry_limit` range: `1..20` (default `5`).
+- Each CI cycle appends a timeline event with iteration, status, and timestamp.
+
+### Scoring model
+Implemented in `backend/app/core/scoring.py`:
 - Base score: `100`
-- Speed bonus: `+10` if runtime < 5 minutes
-- Efficiency penalty: `-2` per commit over 20
-- Final score shown in dashboard and `results.json`
+- Speed bonus: `+10` if duration < 300s
+- Efficiency penalty: `2 × max(0, commit_count - 20)`
+- Final score: clamped at `>= 0`
 
-## Branch and Commit Compliance Rules
-- Branch format must be exactly `TEAM_NAME_LEADER_NAME_AI_Fix`
-- Branch values are uppercased, spaces become underscores, special characters are removed
-- Commit messages must start with `[AI-AGENT]`
-- Agent must never push directly to `main`
+## Supported bug categories
 
-## Operational Notes
-- GitHub Actions workflow must exist in the target repository for CI polling to produce pass/fail conclusions.
-- For public repos where your token has no push permission, the run ends in `FAILED` with error details shown in dashboard.
-- Agent behavior remains autonomous once a run starts; no manual patching/hardcoded test paths are used.
+Core bug type taxonomy (API + fix entries):
+- `LINTING`
+- `SYNTAX`
+- `LOGIC`
+- `TYPE_ERROR`
+- `IMPORT`
+- `INDENTATION`
 
-## Submission Checklist
-- [ ] Public GitHub repository URL
-- [ ] Live deployed dashboard URL
-- [ ] LinkedIn video URL (2–3 min, tags @RIFT2026)
-- [ ] README completed with final team/deployment/video values
-- [ ] Architecture walkthrough included in demo
+Each fix row includes:
+- file
+- bug type
+- line number
+- commit message
+- status (`FIXED`/`FAILED`)
+- expected dashboard output string
+
+## Data outputs
+
+At end of a run, backend writes:
+- `backend/data/results_<run_id>.json` (historical)
+- `backend/data/results.json` (latest snapshot)
+
+These runtime files are ignored by git via `.gitignore`.
+
+## Testing
+
+Existing test scripts in repository root and backend include:
+- `test_all_bug_types.py`
+- `test_dashboard_scenario.py`
+- `test_rift_compliance.py`
+- `backend/test_multi_language.py`
+- `backend/test_token.py`
+
+Run a sample backend test:
+
+```bash
+cd backend
+python test_multi_language.py
+```
+
+## Troubleshooting
+
+- **Run stuck or fails after push**
+	- verify token permissions (`repo`, Actions read)
+	- verify target repository allows branch push
+- **CI status always failed/unknown**
+	- ensure target repo has a workflow that triggers on pushed branch
+- **Docker sandbox not used**
+	- ensure `docker version` works; otherwise service falls back to direct execution
+- **CORS/API errors in frontend**
+	- verify `VITE_API_BASE` and backend URL/port
+
+## Additional docs
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [API reference](docs/API.md)
+- [Development notes](docs/DEVELOPMENT.md)
+- [Sandbox execution details](docs/SANDBOX_EXECUTION.md)
 

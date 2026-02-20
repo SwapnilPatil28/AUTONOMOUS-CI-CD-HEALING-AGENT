@@ -27,7 +27,7 @@ export default function InputSection() {
           <input
             value={repositoryUrl}
             onChange={(e) => setRepositoryUrl(e.target.value)}
-            placeholder="https://github.com/owner/repo"
+            placeholder="https://github.com/yourorg/yourrepo"
             required
             type="url"
           />
@@ -37,7 +37,7 @@ export default function InputSection() {
           <input
             value={teamName}
             onChange={(e) => setTeamName(e.target.value)}
-            placeholder="RIFT ORGANISERS"
+            placeholder="Enter your team name"
             required
           />
         </label>
@@ -46,7 +46,7 @@ export default function InputSection() {
           <input
             value={teamLeaderName}
             onChange={(e) => setTeamLeaderName(e.target.value)}
-            placeholder="Saiyam Kumar"
+            placeholder="Enter team leader name"
             required
           />
         </label>
