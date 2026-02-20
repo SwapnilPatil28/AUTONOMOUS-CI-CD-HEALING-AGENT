@@ -17,6 +17,8 @@ from app.services.failure_parser import FailureParserService
 from app.services.github_ops import GitHubOpsService
 from app.services.patch_applier import PatchApplierService
 from app.services.static_analyzer import StaticAnalyzerService
+from app.services.multi_language_analyzer import MultiLanguageAnalyzerService
+from app.services.multi_language_patch_applier import MultiLanguagePatchApplierService
 from app.services.storage import StorageService
 from app.services.test_engine import TestEngineService
 
@@ -34,8 +36,10 @@ class RunnerService:
         self.github_ops = GitHubOpsService()
         self.test_engine = TestEngineService(use_docker=True)  # ✅ SANDBOXED DOCKER EXECUTION
         self.failure_parser = FailureParserService()
-        self.patch_applier = PatchApplierService()
-        self.static_analyzer = StaticAnalyzerService()
+        self.patch_applier = PatchApplierService()  # Keep for backward compatibility
+        self.static_analyzer = StaticAnalyzerService()  # Keep for backward compatibility
+        self.multi_language_analyzer = MultiLanguageAnalyzerService()  # 🌐 MULTI-LANGUAGE SUPPORT
+        self.multi_language_patcher = MultiLanguagePatchApplierService()  # 🌐 MULTI-LANGUAGE PATCHING
 
     def build_initial_state(self, run_id: str, payload: RunRequest, branch_name: str) -> dict[str, Any]:
         return {
@@ -112,7 +116,7 @@ class RunnerService:
 
                     test_result = self.test_engine.run_tests(repo_dir)
                     parsed_failures = self.failure_parser.parse(test_result.output)
-                    static_failures = self.static_analyzer.analyze(repo_dir)
+                    static_failures = self.multi_language_analyzer.analyze(repo_dir)  # 🌐 MULTI-LANGUAGE ANALYSIS
 
                     parsed_failures = self._normalize_failure_paths(parsed_failures, repo_dir)
                     static_failures = self._normalize_failure_paths(static_failures, repo_dir)
@@ -185,7 +189,7 @@ class RunnerService:
                             {"message": ""},
                         )
 
-                        applied = self.patch_applier.apply_fix(
+                        applied = self.multi_language_patcher.apply_fix(  # 🌐 MULTI-LANGUAGE PATCHING
                             repo_path=repo_dir,
                             file_path=fix_plan.file,
                             line_number=fix_plan.line_number,
