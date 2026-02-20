@@ -8,6 +8,27 @@ A full-stack autonomous repair system that:
 - polls GitHub Actions status,
 - and returns a complete run report to a React dashboard.
 
+## Submission Details
+
+### Live Deployment URL
+- Frontend (Public): https://autonomous-ci-cd-healing-agent-6bi9ddxeg.vercel.app/
+
+### LinkedIn Video URL
+- Demo Video (Public, tags @RIFT2026): https://www.linkedin.com/posts/swapnil-f-patil_rift2026-devops-ai-activity-7430438535666606081-xP2_?utm_source=share&utm_medium=member_desktop&rcm=ACoAAFymtjIBabJETorSB6mAszTXv5tAdOSQylY
+
+### Team Members
+- Team Name: `The Collective`
+- Team Leader: `Tamanwit Sadhukhan`
+- Team Members:
+	- `Swapnil Patil`
+	- `Abhinav Bharti`
+
+### Known Limitations
+- Docker sandboxing depends on Docker availability in runtime environment; otherwise test execution falls back to host mode.
+- CI status depends on the target repository having an active GitHub Actions workflow for the pushed branch.
+- Current test command discovery is heuristic-based (framework detection by repository structure) and may need tuning for uncommon setups.
+- Runtime data is stored on local filesystem/SQLite by default, which may be ephemeral on some hosting platforms.
+
 ## What this project includes
 
 - **Backend API** (`FastAPI`) for run lifecycle management
