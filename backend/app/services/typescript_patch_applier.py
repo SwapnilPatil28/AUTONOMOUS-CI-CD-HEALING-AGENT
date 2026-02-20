@@ -75,6 +75,14 @@ class TypeScriptPatchApplierService:
 
         if "closing bracket" in msg.lower() and not line.rstrip().endswith("]"):
             lines[line_num - 1] = line.rstrip() + "]"
+
+        if "missing semicolon in interface property" in msg.lower():
+            if not line.rstrip().endswith(";"):
+                lines[line_num - 1] = line.rstrip() + ";"
+
+        if "missing opening brace after method declaration" in msg.lower():
+            if not line.rstrip().endswith("{"):
+                lines[line_num - 1] = line.rstrip() + " {"
         
         return "\n".join(lines)
 
@@ -125,7 +133,7 @@ class TypeScriptPatchApplierService:
                 new_name = old_name[0].upper() + old_name[1:] if old_name else old_name
                 lines[line_num - 1] = line.replace(f"interface {old_name}", f"interface {new_name}")
                 source = "\n".join(lines)
-                source = source.replace(f":{old_name}", f":{new_name}")
+                source = re.sub(rf"(:\s*){re.escape(old_name)}\b", rf"\1{new_name}", source)
                 lines = source.split("\n")
 
         if "unused variable" in msg.lower():
@@ -181,6 +189,9 @@ class TypeScriptPatchApplierService:
         if "comparison for min uses '>'" in msg.lower() and ">" in line:
             lines[line_num - 1] = line.replace(">", "<", 1)
 
+        if "comparison uses '!=='" in msg.lower() and "!==" in line:
+            lines[line_num - 1] = line.replace("!==", "===", 1)
+
         if "return inside accumulation loop" in msg.lower() and line.lstrip().startswith("return"):
             for prev_idx in range(line_num - 2, -1, -1):
                 prev_line = lines[prev_idx]
@@ -228,6 +239,9 @@ class TypeScriptPatchApplierService:
 
         if "mixed numeric and string values in collection" in msg.lower():
             lines[line_num - 1] = re.sub(r'"\s*(-?\d+(?:\.\d+)?)\s*"', r"\1", line)
+
+        if "argument type mismatch expected boolean got string" in msg.lower():
+            lines[line_num - 1] = re.sub(r"['\"](true|false)['\"]", r"\1", line)
         
         return "\n".join(lines)
 
@@ -237,7 +251,15 @@ class TypeScriptPatchApplierService:
         if line_num > len(lines):
             return source
         
-        lines[line_num - 1] = "  " + lines[line_num - 1]
+        for prev_idx in range(line_num - 2, -1, -1):
+            prev_line = lines[prev_idx]
+            if prev_line.rstrip().endswith("{"):
+                base_indent = len(prev_line) - len(prev_line.lstrip())
+                stripped = lines[line_num - 1].lstrip()
+                lines[line_num - 1] = (" " * (base_indent + 2)) + stripped
+                return "\n".join(lines)
+
+        lines[line_num - 1] = "  " + lines[line_num - 1].lstrip()
         
         return "\n".join(lines)
 

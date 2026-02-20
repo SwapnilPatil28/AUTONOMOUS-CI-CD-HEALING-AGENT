@@ -41,11 +41,17 @@ class TypeScriptAnalyzerService:
         """Detect SYNTAX errors: missing semicolons, type annotations, braces."""
         failures = []
         lines = source.split("\n")
+        in_interface = False
         
         for idx, line in enumerate(lines, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith("//"):
                 continue
+
+            if stripped.startswith("interface ") and "{" in stripped:
+                in_interface = True
+            if in_interface and stripped.startswith("}"):
+                in_interface = False
             
             # Missing semicolon
             if (
@@ -65,6 +71,22 @@ class TypeScriptAnalyzerService:
                 if ":" not in stripped and "=" in stripped:
                     # Could warn about missing type annotation
                     pass
+
+            if in_interface and ":" in stripped and not stripped.endswith(";") and not stripped.endswith("{"):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing semicolon in interface property",
+                })
+
+            if re.search(r"\b(public|private|protected)?\s*\w[\w<>\[\]]*\s+\w+\s*\([^)]*\)\s*$", stripped) and "{" not in stripped:
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing opening brace after method declaration",
+                })
 
             if stripped.count("(") > stripped.count(")") and stripped.endswith(";"):
                 failures.append({
@@ -299,6 +321,20 @@ class TypeScriptAnalyzerService:
                         })
                         break
 
+            if re.search(r"if\s*\([^)]*!==[^)]*\)", line):
+                next_line = ""
+                for look_ahead in range(idx, min(len(lines), idx + 3)):
+                    if lines[look_ahead].strip():
+                        next_line = lines[look_ahead]
+                        break
+                if "return" in next_line:
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LOGIC",
+                        "message": "comparison uses '!==', did you mean '==='?",
+                    })
+
             const_assign = re.search(r"\b([a-zA-Z_]\w*)\s*=\s*(-?\d+(?:\.\d+)?)\s*;", line)
             if const_assign:
                 assigned_constants.append((idx, const_assign.group(1), float(const_assign.group(2))))
@@ -351,6 +387,17 @@ class TypeScriptAnalyzerService:
         """Detect TYPE_ERROR: string+number without conversion."""
         failures = []
         lines = source.split("\n")
+        boolean_params: dict[str, set[int]] = {}
+
+        for line in lines:
+            sig_match = re.search(r"\b([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:\{|$)", line)
+            if not sig_match:
+                continue
+            fn_name = sig_match.group(1)
+            params = [p.strip() for p in sig_match.group(2).split(",") if p.strip()]
+            for idx, param in enumerate(params):
+                if ":" in param and "boolean" in param:
+                    boolean_params.setdefault(fn_name, set()).add(idx)
         
         for idx, line in enumerate(lines, 1):
             # String + number (TypeScript should catch this at compile time, but check anyway)
@@ -374,6 +421,20 @@ class TypeScriptAnalyzerService:
                     "bug_type": "TYPE_ERROR",
                     "message": "mixed numeric and string values in collection",
                 })
+
+            call_match = re.search(r"\b([A-Za-z_]\w*)\s*\(([^)]*)\)", line)
+            if call_match:
+                fn_name = call_match.group(1)
+                args = [a.strip() for a in call_match.group(2).split(",") if a.strip()]
+                if fn_name in boolean_params:
+                    for pos in boolean_params[fn_name]:
+                        if pos < len(args) and re.match(r"['\"](true|false)['\"]", args[pos]):
+                            failures.append({
+                                "file": file_path,
+                                "line_number": idx,
+                                "bug_type": "TYPE_ERROR",
+                                "message": "argument type mismatch expected boolean got string",
+                            })
         
         return failures
 
@@ -387,8 +448,10 @@ class TypeScriptAnalyzerService:
             next_line = lines[idx + 1]
             
             if line.rstrip().endswith("{"):
-                if next_line.strip() and not next_line.startswith((" ", "\t")):
-                    if not next_line.strip().startswith("}"):
+                if next_line.strip() and not next_line.strip().startswith("}"):
+                    current_indent = len(line) - len(line.lstrip())
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent <= current_indent:
                         failures.append({
                             "file": file_path,
                             "line_number": idx + 2,

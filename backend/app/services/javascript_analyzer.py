@@ -70,6 +70,22 @@ class JavaScriptAnalyzerService:
                     "message": "Missing closing parenthesis",
                 })
 
+            if stripped.startswith("if ") and "{" in stripped and ")" not in stripped.split("{", 1)[0]:
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing closing parenthesis before '{'",
+                })
+
+            if "console.log" in stripped and re.search(r"\(\s*['\"][^'\"]*['\"]\s+[A-Za-z_]\w*\s*\)", stripped):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing concatenation operator in console.log",
+                })
+
             if stripped.count("[") > stripped.count("]") and stripped.endswith(";"):
                 failures.append({
                     "file": file_path,
@@ -146,6 +162,19 @@ class JavaScriptAnalyzerService:
                     "bug_type": "LINTING",
                     "message": f"Class '{class_name}' should use PascalCase",
                 })
+
+        # Function naming: should use camelCase
+        for idx, line in enumerate(lines, 1):
+            match = re.search(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+            if match:
+                fn_name = match.group(1)
+                if "_" in fn_name or fn_name[:1].isupper():
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LINTING",
+                        "message": f"function name should be camelCase: '{fn_name}'",
+                    })
 
         # Unused variables (simple heuristic)
         declared: dict[str, int] = {}
@@ -340,6 +369,7 @@ class JavaScriptAnalyzerService:
         """Detect TYPE_ERROR: string+number without conversion."""
         failures = []
         lines = source.split("\n")
+        string_assigned: set[str] = set()
         
         for idx, line in enumerate(lines, 1):
             # String concatenation with numbers (dynamic types)
@@ -357,6 +387,19 @@ class JavaScriptAnalyzerService:
                         "bug_type": "TYPE_ERROR",
                         "message": "type mismatch: string concatenation requires conversion",
                     })
+
+            assign_match = re.search(r"\b(let|const|var)\s+(\w+)\s*=\s*['\"][^'\"]*['\"]\s*;", line)
+            if assign_match:
+                string_assigned.add(assign_match.group(2))
+
+            push_match = re.search(r"\b(\w+)\s*\.\s*push\s*\(", line)
+            if push_match and push_match.group(1) in string_assigned:
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "TYPE_ERROR",
+                    "message": "attempting to push to non-array",
+                })
 
             if re.search(r"\[[^\]]*\d+[^\]]*['\"]\d+['\"][^\]]*\]", line):
                 failures.append({
@@ -379,8 +422,10 @@ class JavaScriptAnalyzerService:
             
             # After opening brace, next non-empty line should be indented more
             if line.rstrip().endswith("{"):
-                if next_line.strip() and not next_line.startswith((" ", "\t")):
-                    if not next_line.strip().startswith("}"):
+                if next_line.strip() and not next_line.strip().startswith("}"):
+                    current_indent = len(line) - len(line.lstrip())
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent <= current_indent:
                         failures.append({
                             "file": file_path,
                             "line_number": idx + 2,

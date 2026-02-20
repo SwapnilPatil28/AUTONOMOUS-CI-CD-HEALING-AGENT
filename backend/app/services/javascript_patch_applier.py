@@ -75,6 +75,12 @@ class JavaScriptPatchApplierService:
 
         if "closing bracket" in msg.lower() and not line.rstrip().endswith("]"):
             lines[line_num - 1] = line.rstrip() + "]"
+
+        if "missing closing parenthesis before" in msg.lower() and "if" in line:
+            lines[line_num - 1] = re.sub(r"\{\s*$", r") {", line)
+
+        if "missing concatenation operator" in msg.lower() and "console.log" in line:
+            lines[line_num - 1] = re.sub(r"(['\"][^'\"]*['\"])\s+([A-Za-z_]\w*)", r"\1 + \2", line)
         
         return "\n".join(lines)
 
@@ -117,6 +123,21 @@ class JavaScriptPatchApplierService:
                 source = source.replace(f" {old_name} ", f" {new_name} ")
                 source = source.replace(f"new {old_name}", f"new {new_name}")
                 lines = source.split("\n")
+
+        if "function name should be camelcase" in msg.lower():
+            match = re.search(r"'([A-Za-z_][A-Za-z0-9_]*)'", msg)
+            if match:
+                old_name = match.group(1)
+                parts = [part for part in re.split(r"[_\s]+", old_name) if part]
+                if parts:
+                    camel = parts[0][:1].lower() + parts[0][1:]
+                    camel += "".join(part[:1].upper() + part[1:] for part in parts[1:])
+                else:
+                    camel = old_name[:1].lower() + old_name[1:]
+                if camel != old_name:
+                    source = "\n".join(lines)
+                    source = re.sub(rf"\b{re.escape(old_name)}\b", camel, source)
+                    lines[:] = source.split("\n")
 
         if "unused variable" in msg.lower():
             if re.match(r"^\s*(let|const|var)\s+\w+\s*(=|;)\s*", line):
@@ -219,6 +240,17 @@ class JavaScriptPatchApplierService:
 
         if "mixed numeric and string values in collection" in msg.lower():
             lines[line_num - 1] = re.sub(r'"\s*(-?\d+(?:\.\d+)?)\s*"', r"\1", line)
+
+        if "push" in msg.lower():
+            push_match = re.search(r"\b(\w+)\s*\.\s*push\s*\(", line)
+            if push_match:
+                var_name = push_match.group(1)
+                for prev_idx in range(line_num - 2, -1, -1):
+                    prev_line = lines[prev_idx]
+                    assign_match = re.search(rf"^\s*(let|const|var)\s+{re.escape(var_name)}\s*=\s*['\"][^'\"]*['\"]\s*;", prev_line)
+                    if assign_match:
+                        lines[prev_idx] = re.sub(r"=\s*['\"][^'\"]*['\"]", "= []", prev_line)
+                        break
         
         return "\n".join(lines)
 
@@ -227,8 +259,16 @@ class JavaScriptPatchApplierService:
         lines = source.split("\n")
         if line_num > len(lines):
             return source
-        
-        lines[line_num - 1] = "  " + lines[line_num - 1]
+
+        for prev_idx in range(line_num - 2, -1, -1):
+            prev_line = lines[prev_idx]
+            if prev_line.rstrip().endswith("{"):
+                base_indent = len(prev_line) - len(prev_line.lstrip())
+                stripped = lines[line_num - 1].lstrip()
+                lines[line_num - 1] = (" " * (base_indent + 2)) + stripped
+                return "\n".join(lines)
+
+        lines[line_num - 1] = "  " + lines[line_num - 1].lstrip()
         
         return "\n".join(lines)
 

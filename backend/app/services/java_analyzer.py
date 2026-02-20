@@ -155,6 +155,20 @@ class JavaAnalyzerService:
                     "message": f"Class '{class_name}' should use PascalCase",
                 })
 
+        # Method naming: should use camelCase
+        for idx, line in enumerate(lines, 1):
+            match = re.search(r"\b(?:public|private|protected)?\s*(?:static\s+)?\w[\w<>\[\]]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+            if match:
+                method_name = match.group(1)
+                if "_" in method_name or method_name[:1].isupper():
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LINTING",
+                        "message": f"method name should be camelCase: '{method_name}'",
+                    })
+
+
         # Unused variables (simple heuristic)
         declared: dict[str, int] = {}
         for idx, line in enumerate(lines, 1):
@@ -238,6 +252,16 @@ class JavaAnalyzerService:
                         "bug_type": "LOGIC",
                         "message": "Possible wrong operator: using -= for addition operation",
                     })
+
+            # Accumulator subtraction likely wrong (total/sum)
+            subtract_match = re.search(r"\b(total|sum|count)\w*\s*-=\s*\w+", line)
+            if subtract_match and "remove" not in line.lower() and "decrement" not in line.lower():
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "LOGIC",
+                    "message": "addition operation uses '-='",
+                })
             
             # Wrong divisor for average
             if re.search(r"sum\s*\/\s*(\d+)", line) and "/" in line:
@@ -377,6 +401,15 @@ class JavaAnalyzerService:
                     "message": "Type error: adding number to String",
                 })
 
+            # String literal assigned to numeric type
+            if re.search(r"\b(int|long|double|float)\s+\w+\s*=\s*\"-?\d+(?:\.\d+)?\"\s*;", line):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "TYPE_ERROR",
+                    "message": "assigned string literal to numeric type",
+                })
+
             # Mixed numeric/string collection literal
             if re.search(r"\{[^}]*\d+[^}]*['\"]\d+['\"][^}]*\}", line):
                 failures.append({
@@ -399,8 +432,10 @@ class JavaAnalyzerService:
             
             # After opening brace, next non-empty line should be indented more
             if line.rstrip().endswith("{"):
-                if next_line.strip() and not next_line.startswith((" ", "\t")):
-                    if not next_line.strip().startswith("}"):
+                if next_line.strip() and not next_line.strip().startswith("}"):
+                    current_indent = len(line) - len(line.lstrip())
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent <= current_indent:
                         failures.append({
                             "file": file_path,
                             "line_number": idx + 2,

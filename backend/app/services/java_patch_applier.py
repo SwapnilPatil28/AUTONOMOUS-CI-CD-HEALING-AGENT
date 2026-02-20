@@ -122,13 +122,30 @@ class JavaPatchApplierService:
             match = re.search(r"Class '(\w+)'", msg)
             if match:
                 old_name = match.group(1)
-                new_name = old_name[0].upper() + old_name[1:] if old_name else old_name
+                parts = [part for part in re.split(r"[_\s]+", old_name) if part]
+                new_name = "".join(part[:1].upper() + part[1:] for part in parts) if parts else (old_name[:1].upper() + old_name[1:])
                 lines[line_num - 1] = line.replace(f"class {old_name}", f"class {new_name}")
                 # Update all references
                 source = "\n".join(lines)
                 source = source.replace(f" {old_name} ", f" {new_name} ")
                 source = source.replace(f"new {old_name}(", f"new {new_name}(")
                 lines = source.split("\n")
+
+        # Fix method name to camelCase
+        if "method name should be camelcase" in msg.lower():
+            match = re.search(r"'([A-Za-z_][A-Za-z0-9_]*)'", msg)
+            if match:
+                old_name = match.group(1)
+                parts = [part for part in re.split(r"[_\s]+", old_name) if part]
+                if parts:
+                    camel = parts[0][:1].lower() + parts[0][1:]
+                    camel += "".join(part[:1].upper() + part[1:] for part in parts[1:])
+                else:
+                    camel = old_name[:1].lower() + old_name[1:]
+                if camel != old_name:
+                    source = "\n".join(lines)
+                    source = re.sub(rf"\b{re.escape(old_name)}\b", camel, source)
+                    lines[:] = source.split("\n")
 
         # Remove unused variable assignment
         if "unused variable" in msg.lower():
@@ -255,6 +272,10 @@ class JavaPatchApplierService:
                 var = match.group(1)
                 lines[line_num - 1] = line.replace(f"+ {var}", f"+ String.valueOf({var})")
 
+        # Fix numeric assignment from string literal
+        if "assigned string literal to numeric type" in msg.lower():
+            lines[line_num - 1] = re.sub(r'"(-?\d+(?:\.\d+)?)"', r"\1", line)
+
         # Fix mixed numeric/string collection literal
         if "mixed numeric and string values in collection" in msg.lower():
             lines[line_num - 1] = re.sub(r'"\s*(-?\d+(?:\.\d+)?)\s*"', r"\1", line)
@@ -267,8 +288,16 @@ class JavaPatchApplierService:
         if line_num > len(lines):
             return source
         
-        # Add proper indentation
-        lines[line_num - 1] = "    " + lines[line_num - 1]
+        # Add proper indentation based on previous brace
+        for prev_idx in range(line_num - 2, -1, -1):
+            prev_line = lines[prev_idx]
+            if prev_line.rstrip().endswith("{"):
+                base_indent = len(prev_line) - len(prev_line.lstrip())
+                stripped = lines[line_num - 1].lstrip()
+                lines[line_num - 1] = (" " * (base_indent + 4)) + stripped
+                return "\n".join(lines)
+
+        lines[line_num - 1] = "    " + lines[line_num - 1].lstrip()
         
         return "\n".join(lines)
 
