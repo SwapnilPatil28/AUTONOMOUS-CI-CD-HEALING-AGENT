@@ -57,6 +57,22 @@ class JavaAnalyzerService:
                     "bug_type": "SYNTAX",
                     "message": "Missing semicolon at end of statement",
                 })
+
+            # Method call statement missing semicolon (e.g., System.out.println(...))
+            if (
+                stripped.endswith(")")
+                and not stripped.endswith(");")
+                and not re.match(r"^\s*(if|for|while|switch|catch|synchronized)\b", stripped)
+                and not re.search(r"\)\s*\{\s*$", stripped)
+                and "class" not in stripped
+                and "interface" not in stripped
+            ):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing semicolon at end of statement",
+                })
             
             # Missing opening brace for method/class
             if re.search(r"(public|private|protected)?\s*(static)?\s*(class|interface|void|int|String|boolean|double|float)\s+\w+\s*\([^)]*\)\s*$", stripped):
