@@ -11,7 +11,7 @@ A full-stack autonomous repair system that:
 ## Submission Details
 
 ### Live Deployment URL
-- Frontend (Public): https://autonomous-ci-cd-healing-agent-6bi9ddxeg.vercel.app/
+- Frontend (Public): https://autonomous-ci-cd-healing-agent-three.vercel.app/
 
 ### LinkedIn Video URL
 - Demo Video (Public, tags @RIFT2026): https://www.linkedin.com/posts/swapnil-f-patil_rift2026-devops-ai-activity-7430438535666606081-xP2_?utm_source=share&utm_medium=member_desktop&rcm=ACoAAFymtjIBabJETorSB6mAszTXv5tAdOSQylY
