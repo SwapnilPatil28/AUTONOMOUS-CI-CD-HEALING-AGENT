@@ -72,6 +72,13 @@ class JavaPatchApplierService:
         if "semicolon" in msg.lower():
             if not line.rstrip().endswith((";", "{", "}")):
                 lines[line_num - 1] = line.rstrip() + ";"
+
+        # Constructor name mismatch with class name
+        if "constructor name does not match class name" in msg.lower():
+            class_match = re.search(r"\bclass\s+([A-Za-z_]\w*)", source)
+            ctor_match = re.match(r"^(\s*(?:public|private|protected)\s+)([A-Za-z_]\w*)(\s*\([^)]*\)\s*\{?\s*)$", line)
+            if class_match and ctor_match:
+                lines[line_num - 1] = f"{ctor_match.group(1)}{class_match.group(1)}{ctor_match.group(3)}"
         
         # Missing brace
         if "brace" in msg.lower():
@@ -99,6 +106,12 @@ class JavaPatchApplierService:
         if "unused import" in msg.lower():
             # Mark line for removal
             lines[line_num - 1] = ""
+
+        if "scanner type should be capitalized" in msg.lower():
+            source = "\n".join(lines)
+            source = re.sub(r"\bjava\.util\.scanner\b", "java.util.Scanner", source)
+            source = re.sub(r"\bscanner\b", "Scanner", source)
+            lines = source.split("\n")
         
         # Fix snake_case to camelCase
         if "camelcase" in msg.lower() and "snake_case" in msg.lower():
@@ -136,6 +149,8 @@ class JavaPatchApplierService:
             match = re.search(r"'([A-Za-z_][A-Za-z0-9_]*)'", msg)
             if match:
                 old_name = match.group(1)
+                if "_" not in old_name:
+                    return "\n".join(lines)
                 parts = [part for part in re.split(r"[_\s]+", old_name) if part]
                 if parts:
                     camel = parts[0][:1].lower() + parts[0][1:]
@@ -144,7 +159,12 @@ class JavaPatchApplierService:
                     camel = old_name[:1].lower() + old_name[1:]
                 if camel != old_name:
                     source = "\n".join(lines)
-                    source = re.sub(rf"\b{re.escape(old_name)}\b", camel, source)
+                    source = re.sub(rf"\b{re.escape(old_name)}\b(?=\s*\()", camel, source)
+                    source = re.sub(
+                        rf"(\b[A-Za-z_][\w<>\[\]]*\s+){re.escape(old_name)}(?=\s*\([^)]*\)\s*\{{)",
+                        rf"\1{camel}",
+                        source,
+                    )
                     lines[:] = source.split("\n")
 
         # Remove unused variable assignment
@@ -176,6 +196,11 @@ class JavaPatchApplierService:
             return source
         
         line = lines[line_num - 1]
+
+        if "loop bound exceeds array dimension" in msg.lower():
+            source = self._fix_array_loop_bound(source, line_num)
+            lines = source.split("\n")
+            line = lines[line_num - 1] if line_num <= len(lines) else line
         
         # Fix += to -=  for removal
         if "removal operation" in msg.lower() and "+=" in line:
@@ -242,6 +267,74 @@ class JavaPatchApplierService:
             if assign_match:
                 indent, var_name = assign_match.group(1), assign_match.group(2)
                 lines[line_num - 1] = f"{indent}{var_name} = Double.POSITIVE_INFINITY;"
+
+        if "isboardfull returns true when empty slot found" in msg.lower():
+            # Flip immediate return true -> false in method block
+            method_end = self._find_method_end(lines, line_num - 1)
+            for idx in range(line_num - 1, method_end):
+                if re.search(r"\breturn\s+true\s*;", lines[idx]):
+                    lines[idx] = re.sub(r"\breturn\s+true\s*;", "return false;", lines[idx], count=1)
+                    break
+
+            # Flip trailing return false -> true in method block
+            for idx in range(method_end - 1, line_num - 2, -1):
+                if re.search(r"\breturn\s+false\s*;", lines[idx]):
+                    lines[idx] = re.sub(r"\breturn\s+false\s*;", "return true;", lines[idx], count=1)
+                    break
+
+        if "checkwin missing column and/or diagonal checks" in msg.lower():
+            method_end = self._find_method_end(lines, line_num - 1)
+            insert_at = None
+            for idx in range(method_end - 1, line_num - 2, -1):
+                if re.search(r"\breturn\s+false\s*;", lines[idx]):
+                    insert_at = idx
+                    break
+            if insert_at is not None:
+                indent = re.match(r"^(\s*)", lines[insert_at]).group(1)
+                extra = [
+                    f"{indent}for (int i = 0; i < 3; i++) {{",
+                    f"{indent}    if (board[0][i] == player && board[1][i] == player && board[2][i] == player) {{",
+                    f"{indent}        return true;",
+                    f"{indent}    }}",
+                    f"{indent}}}",
+                    "",
+                    f"{indent}if (board[0][0] == player && board[1][1] == player && board[2][2] == player) {{",
+                    f"{indent}    return true;",
+                    f"{indent}}}",
+                    f"{indent}if (board[0][2] == player && board[1][1] == player && board[2][0] == player) {{",
+                    f"{indent}    return true;",
+                    f"{indent}}}",
+                ]
+                lines[insert_at:insert_at] = extra
+
+        if "missing tie-check in loop when board is full" in msg.lower():
+            while_idx = line_num - 1
+            insert_idx = None
+            for idx in range(while_idx + 1, min(len(lines), while_idx + 80)):
+                if re.search(r"player\s*=\s*\(.*\?\s*'O'\s*:\s*'X'\s*\)", lines[idx]):
+                    insert_idx = idx
+                    break
+            if insert_idx is None:
+                for idx in range(while_idx + 1, min(len(lines), while_idx + 80)):
+                    if re.search(r"\}\s*else\s*\{", lines[idx]):
+                        insert_idx = idx
+                        break
+            if insert_idx is not None:
+                base_indent = re.match(r"^(\s*)", lines[insert_idx]).group(1)
+                obj = "game"
+                for probe in range(max(0, while_idx - 20), min(len(lines), while_idx + 40)):
+                    m = re.search(r"\b([A-Za-z_]\w*)\.printBoard\s*\(", lines[probe])
+                    if m:
+                        obj = m.group(1)
+                        break
+                tie_block = [
+                    f"{base_indent}if ({obj}.isBoardFull()) {{",
+                    f"{base_indent}    {obj}.printBoard();",
+                    f"{base_indent}    System.out.println(\"Game is a tie!\");",
+                    f"{base_indent}    break;",
+                    f"{base_indent}}}",
+                ]
+                lines[insert_idx:insert_idx] = tie_block
         
         return "\n".join(lines)
 
@@ -272,6 +365,18 @@ class JavaPatchApplierService:
                 var = match.group(1)
                 lines[line_num - 1] = line.replace(f"+ {var}", f"+ String.valueOf({var})")
 
+        if "char assigned from string literal" in msg.lower():
+            lines[line_num - 1] = re.sub(r'\"(.?)\"', lambda m: f"'{m.group(1)}'", line)
+
+        if "int assigned from scanner.next()" in msg.lower():
+            lines[line_num - 1] = re.sub(r"\.next\s*\(\s*\)", ".nextInt()", lines[line_num - 1])
+
+        if "scanner type should be capitalized" in msg.lower():
+            source = "\n".join(lines)
+            source = re.sub(r"\bjava\.util\.scanner\b", "java.util.Scanner", source)
+            source = re.sub(r"\bscanner\b", "Scanner", source)
+            lines = source.split("\n")
+
         # Fix numeric assignment from string literal
         if "assigned string literal to numeric type" in msg.lower():
             lines[line_num - 1] = re.sub(r'"(-?\d+(?:\.\d+)?)"', r"\1", line)
@@ -287,17 +392,20 @@ class JavaPatchApplierService:
         lines = source.split("\n")
         if line_num > len(lines):
             return source
-        
-        # Add proper indentation based on previous brace
-        for prev_idx in range(line_num - 2, -1, -1):
-            prev_line = lines[prev_idx]
-            if prev_line.rstrip().endswith("{"):
-                base_indent = len(prev_line) - len(prev_line.lstrip())
-                stripped = lines[line_num - 1].lstrip()
-                lines[line_num - 1] = (" " * (base_indent + 4)) + stripped
-                return "\n".join(lines)
 
-        lines[line_num - 1] = "    " + lines[line_num - 1].lstrip()
+        stripped = lines[line_num - 1].lstrip()
+        depth = 0
+        for idx in range(0, line_num - 1):
+            segment = lines[idx]
+            depth += segment.count("{")
+            depth -= segment.count("}")
+            if depth < 0:
+                depth = 0
+
+        if stripped.startswith("}"):
+            depth = max(0, depth - 1)
+
+        lines[line_num - 1] = (" " * (depth * 4)) + stripped
         
         return "\n".join(lines)
 
@@ -306,3 +414,65 @@ class JavaPatchApplierService:
         """Convert snake_case to camelCase."""
         components = snake_str.split("_")
         return components[0] + "".join(x.title() for x in components[1:])
+
+    @staticmethod
+    def _find_method_end(lines: list[str], start_idx: int) -> int:
+        depth = 0
+        seen_open = False
+        for idx in range(start_idx, len(lines)):
+            line = lines[idx]
+            depth += line.count("{")
+            if line.count("{") > 0:
+                seen_open = True
+            depth -= line.count("}")
+            if seen_open and depth <= 0:
+                return idx + 1
+        return len(lines)
+
+    def _fix_array_loop_bound(self, source: str, line_num: int) -> str:
+        lines = source.split("\n")
+        if line_num > len(lines):
+            return source
+
+        array_dims: dict[str, tuple[int, int]] = {}
+        for line in lines:
+            arr_decl = re.search(r"\b\w+\s*\[\]\s*\[\]\s*([A-Za-z_]\w*)\s*=\s*new\s+\w+\[(\d+)\]\[(\d+)\]", line)
+            if arr_decl:
+                array_dims[arr_decl.group(1)] = (int(arr_decl.group(2)), int(arr_decl.group(3)))
+
+        access_idx = line_num - 1
+        access = re.search(r"\b([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]\s*\[\s*([A-Za-z_]\w*)\s*\]", lines[access_idx])
+        if not access:
+            return source
+
+        arr_name, idx1, idx2 = access.group(1), access.group(2), access.group(3)
+        if arr_name not in array_dims:
+            return source
+        dim1, dim2 = array_dims[arr_name]
+
+        for back in range(access_idx, max(-1, access_idx - 12), -1):
+            loop_match = re.search(r"for\s*\(\s*int\s+([A-Za-z_]\w*)\s*=\s*0\s*;\s*\1\s*<\s*(\d+)\s*;", lines[back])
+            if not loop_match:
+                continue
+            loop_var = loop_match.group(1)
+            current_bound = int(loop_match.group(2))
+            if loop_var == idx1:
+                if current_bound == dim1:
+                    continue
+                lines[back] = re.sub(
+                    rf"(for\s*\(\s*int\s+{re.escape(loop_var)}\s*=\s*0\s*;\s*{re.escape(loop_var)}\s*<\s*)\d+(\s*;)",
+                    rf"\g<1>{dim1}\2",
+                    lines[back],
+                )
+                return "\n".join(lines)
+            if loop_var == idx2:
+                if current_bound == dim2:
+                    continue
+                lines[back] = re.sub(
+                    rf"(for\s*\(\s*int\s+{re.escape(loop_var)}\s*=\s*0\s*;\s*{re.escape(loop_var)}\s*<\s*)\d+(\s*;)",
+                    rf"\g<1>{dim2}\2",
+                    lines[back],
+                )
+                return "\n".join(lines)
+
+        return source

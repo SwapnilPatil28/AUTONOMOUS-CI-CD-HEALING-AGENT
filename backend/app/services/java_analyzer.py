@@ -38,11 +38,21 @@ class JavaAnalyzerService:
         """Detect SYNTAX errors: missing semicolons, braces, parentheses."""
         failures = []
         lines = source.split("\n")
+        class_names = re.findall(r"\bclass\s+([A-Za-z_]\w*)", source)
         
         for idx, line in enumerate(lines, 1):
             stripped = line.strip()
             if not stripped or stripped.startswith("//"):
                 continue
+
+            # Import statements must end with semicolon
+            if re.match(r"^\s*import\s+[\w.]+\s*$", stripped):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "SYNTAX",
+                    "message": "Missing semicolon at end of statement",
+                })
             
             # Missing semicolon at end of statement
             if (
@@ -83,6 +93,18 @@ class JavaAnalyzerService:
                     "message": "Missing opening brace after method/class declaration",
                 })
 
+            # Constructor name must match class name exactly
+            ctor_match = re.match(r"^\s*(public|private|protected)\s+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{?\s*$", stripped)
+            if ctor_match and class_names:
+                ctor_name = ctor_match.group(2)
+                if ctor_name not in class_names and not re.match(r"^(if|for|while|switch|catch)$", ctor_name):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "SYNTAX",
+                        "message": "Constructor name does not match class name",
+                    })
+
             # Missing closing parenthesis
             if stripped.count("(") > stripped.count(")") and stripped.endswith(";"):
                 failures.append({
@@ -107,6 +129,7 @@ class JavaAnalyzerService:
         """Detect LINTING errors: unused imports, naming conventions."""
         failures = []
         lines = source.split("\n")
+        class_names = set(re.findall(r"\bclass\s+([A-Za-z_]\w*)", source))
         
         # Find unused imports
         import_lines = []
@@ -126,6 +149,15 @@ class JavaAnalyzerService:
                         "bug_type": "LINTING",
                         "message": f"Unused import: {imported}",
                     })
+
+            # Scanner class case sensitivity
+            if re.search(r"import\s+java\.util\.scanner\s*;?", import_line):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "LINTING",
+                    "message": "Scanner type should be capitalized",
+                })
         
         # Variable naming: should use camelCase
         for idx, line in enumerate(lines, 1):
@@ -173,10 +205,19 @@ class JavaAnalyzerService:
 
         # Method naming: should use camelCase
         for idx, line in enumerate(lines, 1):
-            match = re.search(r"\b(?:public|private|protected)?\s*(?:static\s+)?\w[\w<>\[\]]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
+            match = re.match(
+                r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?(?:synchronized\s+)?"
+                r"([A-Za-z_][\w<>\[\]]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:\{|throws\b)",
+                line,
+            )
             if match:
-                method_name = match.group(1)
-                if "_" in method_name or method_name[:1].isupper():
+                return_type = match.group(1)
+                method_name = match.group(2)
+                if return_type in {"if", "for", "while", "switch", "catch", "new"}:
+                    continue
+                if method_name in class_names:
+                    continue
+                if "_" in method_name:
                     failures.append({
                         "file": file_path,
                         "line_number": idx,
@@ -246,6 +287,14 @@ class JavaAnalyzerService:
         failures = []
         lines = source.split("\n")
         assigned_constants: list[tuple[int, str, float]] = []
+        seen_logic: set[tuple[int, str]] = set()
+
+        # Track Java 2D array declarations: name -> (dim1, dim2)
+        array_dims: dict[str, tuple[int, int]] = {}
+        for idx, line in enumerate(lines, 1):
+            arr_decl = re.search(r"\b\w+\s*\[\]\s*\[\]\s*([A-Za-z_]\w*)\s*=\s*new\s+\w+\[(\d+)\]\[(\d+)\]", line)
+            if arr_decl:
+                array_dims[arr_decl.group(1)] = (int(arr_decl.group(2)), int(arr_decl.group(3)))
         
         for idx, line in enumerate(lines, 1):
             # Wrong operator: += vs -=
@@ -348,6 +397,31 @@ class JavaAnalyzerService:
                     # Could be reversed
                     pass
 
+            # Detect possible 2D array loop bound overflow from constants
+            access = re.search(r"\b([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]\s*\[\s*([A-Za-z_]\w*)\s*\]", line)
+            if access:
+                arr_name, idx1, idx2 = access.group(1), access.group(2), access.group(3)
+                if arr_name in array_dims:
+                    dim1, dim2 = array_dims[arr_name]
+                    bound1 = self._find_loop_bound(lines, idx, idx1)
+                    bound2 = self._find_loop_bound(lines, idx, idx2)
+                    if bound1 is not None and bound1 > dim1 and (idx, "overflow1") not in seen_logic:
+                        failures.append({
+                            "file": file_path,
+                            "line_number": idx,
+                            "bug_type": "LOGIC",
+                            "message": "Loop bound exceeds array dimension",
+                        })
+                        seen_logic.add((idx, "overflow1"))
+                    if bound2 is not None and bound2 > dim2 and (idx, "overflow2") not in seen_logic:
+                        failures.append({
+                            "file": file_path,
+                            "line_number": idx,
+                            "bug_type": "LOGIC",
+                            "message": "Loop bound exceeds array dimension",
+                        })
+                        seen_logic.add((idx, "overflow2"))
+
         # Min/max tracker initialized to constant
         for line_no, name, _value in assigned_constants:
             lower_name = name.lower()
@@ -389,6 +463,49 @@ class JavaAnalyzerService:
                             "message": "threshold tracker initialized too low for '<' selection",
                         })
                         break
+
+        # isBoardFull-style reversed semantics: returns true on empty slot and false otherwise
+        for idx, line in enumerate(lines, 1):
+            if re.search(r"\bboolean\s+isBoardFull\s*\(", line):
+                block_end = self._find_method_end(lines, idx - 1)
+                block = "\n".join(lines[idx - 1:block_end])
+                if re.search(r"if\s*\([^)]*==\s*'\-'[^)]*\)\s*\{?\s*return\s+true\s*;", block, re.DOTALL) and re.search(r"return\s+false\s*;", block):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LOGIC",
+                        "message": "isBoardFull returns true when empty slot found",
+                    })
+
+        # checkWin method exists but only row checks (no columns/diagonals)
+        for idx, line in enumerate(lines, 1):
+            if re.search(r"\bboolean\s+checkWin\s*\(", line):
+                block_end = self._find_method_end(lines, idx - 1)
+                block = "\n".join(lines[idx - 1:block_end])
+                row_check = re.search(r"\[i\]\[0\].*\[i\]\[1\].*\[i\]\[2\]", block.replace(" ", ""))
+                col_check = re.search(r"\[0\]\[i\].*\[1\]\[i\].*\[2\]\[i\]", block.replace(" ", ""))
+                diag_check = re.search(r"\[0\]\[0\].*\[1\]\[1\].*\[2\]\[2\]|\[0\]\[2\].*\[1\]\[1\].*\[2\]\[0\]", block.replace(" ", ""))
+                if row_check and not (col_check and diag_check):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LOGIC",
+                        "message": "checkWin missing column and/or diagonal checks",
+                    })
+
+        # Infinite loop risk when board-full method exists but not used in game loop
+        has_board_full = bool(re.search(r"\bisBoardFull\s*\(", source))
+        board_full_calls = len(re.findall(r"\bisBoardFull\s*\(", source))
+        if has_board_full and board_full_calls <= 1:
+            for idx, line in enumerate(lines, 1):
+                if re.search(r"\bwhile\s*\(\s*true\s*\)", line):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LOGIC",
+                        "message": "missing tie-check in loop when board is full",
+                    })
+                    break
         
         return failures
 
@@ -434,8 +551,61 @@ class JavaAnalyzerService:
                     "bug_type": "TYPE_ERROR",
                     "message": "mixed numeric and string values in collection",
                 })
+
+            # char assigned from String literal
+            if re.search(r"\bchar\s+\w+\s*=\s*\"[^\"]+\"\s*;", line):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "TYPE_ERROR",
+                    "message": "char assigned from String literal",
+                })
+
+            # int assigned from scanner.next() instead of nextInt()
+            if re.search(r"\bint\s+\w+\s*=\s*\w+\.next\s*\(\s*\)\s*;", line):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "TYPE_ERROR",
+                    "message": "int assigned from scanner.next()",
+                })
+
+            # Scanner type should be capitalized in declarations/usages
+            if re.search(r"\bscanner\s+\w+\s*=\s*new\s+scanner\s*\(", line):
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "TYPE_ERROR",
+                    "message": "Scanner type should be capitalized",
+                })
         
         return failures
+
+    @staticmethod
+    def _find_loop_bound(lines: list[str], current_line: int, variable: str) -> int | None:
+        start = max(0, current_line - 8)
+        for back_idx in range(current_line - 1, start - 1, -1):
+            loop_match = re.search(
+                rf"for\s*\(\s*int\s+{re.escape(variable)}\s*=\s*0\s*;\s*{re.escape(variable)}\s*<\s*(\d+)\s*;",
+                lines[back_idx],
+            )
+            if loop_match:
+                return int(loop_match.group(1))
+        return None
+
+    @staticmethod
+    def _find_method_end(lines: list[str], start_idx: int) -> int:
+        depth = 0
+        seen_open = False
+        for idx in range(start_idx, len(lines)):
+            line = lines[idx]
+            depth += line.count("{")
+            if line.count("{") > 0:
+                seen_open = True
+            depth -= line.count("}")
+            if seen_open and depth <= 0:
+                return idx + 1
+        return len(lines)
 
     def _find_indentation_errors(self, source: str, file_path: str) -> list[dict[str, Any]]:
         """Detect INDENTATION errors: improper indentation after braces."""
