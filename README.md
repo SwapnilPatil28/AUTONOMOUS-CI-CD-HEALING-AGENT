@@ -14,7 +14,7 @@ A full-stack autonomous repair system that:
 - Frontend (Public): https://autonomous-ci-cd-healing-agent-6bi9ddxeg.vercel.app/
 
 ### LinkedIn Video URL
-- Demo Video (Public, tags @RIFT2026): https://www.linkedin.com/posts/swapnil-f-patil_rift2026-devops-ai-activity-7430438535666606081-xP2_?utm_source=share&utm_medium=member_desktop&rcm=ACoAAFymtjIBabJETorSB6mAszTXv5tAdOSQylY
+- Demo Video (Public, tags @RIFT2026): https://www.linkedin.com/posts/swapnil-f-patil_rift2026-devops-ai-activity-7430473185688559616-lzED?utm_source=share&utm_medium=member_desktop&rcm=ACoAAFymtjIBabJETorSB6mAszTXv5tAdOSQylY
 
 ### Team Members
 - Team Name: `The Collective`
