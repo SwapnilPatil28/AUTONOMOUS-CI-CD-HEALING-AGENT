@@ -171,6 +171,32 @@ class JavaPatchApplierService:
         if "unused variable" in msg.lower():
             if re.match(r"^\s*\w[\w<>\[\]]*\s+\w+\s*(=|;)\s*", line):
                 lines[line_num - 1] = ""
+
+        # Fix raw types - add generics
+        if "raw type usage" in msg.lower():
+            raw_match = re.search(r'(HashMap|ArrayList|Map|List|Set|HashSet)\s+(\w+)\s*=\s*new\s+\1\s*\(', line)
+            if raw_match:
+                collection_type = raw_match.group(1)
+                var_name = raw_match.group(2)
+                # Infer generic types from usage context
+                # Default to <String, Object> for maps, <Object> for lists
+                if collection_type in ['HashMap', 'Map']:
+                    lines[line_num - 1] = line.replace(
+                        f'{collection_type} {var_name} = new {collection_type}(',
+                        f'{collection_type}<String, Object> {var_name} = new {collection_type}<>('
+                    )
+                elif collection_type in ['ArrayList', 'List', 'Set', 'HashSet']:
+                    lines[line_num - 1] = line.replace(
+                        f'{collection_type} {var_name} = new {collection_type}(',
+                        f'{collection_type}<Object> {var_name} = new {collection_type}<>('
+                    )
+
+        # Remove unused empty methods
+        if "unused empty method" in msg.lower():
+            method_end = self._find_method_end(lines, line_num - 1)
+            # Remove entire method definition
+            for idx in range(line_num - 1, method_end):
+                lines[idx] = ""
         
         return "\n".join(lines)
 
@@ -335,6 +361,81 @@ class JavaPatchApplierService:
                     f"{base_indent}}}",
                 ]
                 lines[insert_idx:insert_idx] = tie_block
+
+        # Fix infinite recursion: mid not incremented
+        if "infinite recursion" in msg.lower():
+            # Find the middle variable name by looking for pattern: var = (... + ...) / 2
+            mid_var = None
+            for back_idx in range(max(0, line_num - 10), line_num):
+                mid_calc = re.search(r'\b(\w+)\s*=\s*\([^)]*\+[^)]*\)\s*/\s*2', lines[back_idx])
+                if mid_calc:
+                    mid_var = mid_calc.group(1)
+                    break
+            
+            if mid_var:
+                # Find the method call and extract its parameter names
+                recursive_match = re.search(r'(\w+)\s*\(([^)]+)\)', line)
+                if recursive_match:
+                    params = recursive_match.group(2)
+                    param_list = [p.strip() for p in params.split(',')]
+                    
+                    # Find where mid_var appears in parameters
+                    for i, param in enumerate(param_list):
+                        if param == mid_var:
+                            # Replace this mid occurrence with mid +/- 1
+                            # If it's the 3rd param (index 2), use mid - 1 (for low/start)
+                            # If it's the 4th param (index 3), use mid + 1 (for high/end)
+                            if i == 2:
+                                param_list[i] = f"{mid_var} - 1"
+                            elif i == 3:
+                                param_list[i] = f"{mid_var} + 1"
+                    
+                    # Reconstruct the line
+                    method_name = recursive_match.group(1)
+                    new_params = ', '.join(param_list)
+                    lines[line_num - 1] = re.sub(
+                        rf'{method_name}\s*\([^)]+\)',
+                        f'{method_name}({new_params})',
+                        line
+                    )
+
+        # Fix inverted rotated array search logic
+        if "inverted rotated array search logic" in msg.lower():
+            # Extract variable names from the if condition: if (arr[left] <= arr[mid])
+            if_match = re.search(r'if\s*\([^)]*(\w+)\s*\[\s*(\w+)\s*\]\s*<=\s*\1\s*\[\s*(\w+)\s*\]', line)
+            if if_match:
+                left_var = if_match.group(2)
+                
+                # Look ahead to find the else clause and swap assignments
+                for forward_idx in range(line_num, min(len(lines), line_num + 10)):
+                    else_line = lines[forward_idx]
+                    if re.search(r'^\s*\}\s*else\s*\{', else_line):
+                        # Found the else block
+                        if_body_start = line_num
+                        if_body_end = forward_idx
+                        else_body_start = forward_idx + 1
+                        else_body_end = else_body_start + 5
+
+                        # Extract assignments from both blocks (looking for ANY variable assignments)
+                        if_assignments = []
+                        for idx in range(if_body_start, if_body_end):
+                            # Look for any assignment pattern (var = ...)
+                            assign_match = re.search(r'(\w+)\s*=', lines[idx])
+                            if assign_match:
+                                if_assignments.append((idx, lines[idx]))
+
+                        else_assignments = []
+                        for idx in range(else_body_start, min(else_body_end, len(lines))):
+                            assign_match = re.search(r'(\w+)\s*=', lines[idx])
+                            if assign_match:
+                                else_assignments.append((idx, lines[idx]))
+
+                        # Swap them
+                        if if_assignments and else_assignments:
+                            if_idx, if_content = if_assignments[0]
+                        else_idx, else_content = else_assignments[0]
+                        lines[if_idx], lines[else_idx] = lines[else_idx], lines[if_idx]
+                    break
         
         return "\n".join(lines)
 
@@ -384,6 +485,32 @@ class JavaPatchApplierService:
         # Fix mixed numeric/string collection literal
         if "mixed numeric and string values in collection" in msg.lower():
             lines[line_num - 1] = re.sub(r'"\s*(-?\d+(?:\.\d+)?)\s*"', r"\1", line)
+
+        # int method returning String literal - wrap in Integer.parseInt() or return -1
+        if "int method returning string literal" in msg.lower():
+            # Change "return "text";" to "return -1;" for int methods
+            lines[line_num - 1] = re.sub(r'\breturn\s+"[^"]*"\s*;', 'return -1;', line)
+
+        # int method returning decimal literal - cast to int
+        if "int method returning decimal literal" in msg.lower():
+            lines[line_num - 1] = re.sub(r'\breturn\s+(-?\d+)\.\d+\s*;', r'return \1;', line)
+
+        # String method returning int literal - wrap in quotes
+        if "string method returning int literal" in msg.lower():
+            lines[line_num - 1] = re.sub(r'\breturn\s+(-?\d+)\s*;', r'return "\1";', line)
+
+        # Map<String, Double> receiving String value - convert to Double.parseDouble()
+        if "map<string, double> receiving string value" in msg.lower():
+            put_match = re.search(r'(\w+)\.put\s*\(([^,]+),\s*"([^"]+)"\s*\)', line)
+            if put_match:
+                map_name, key, str_value = put_match.group(1), put_match.group(2), put_match.group(3)
+                # Try to convert to double if numeric
+                try:
+                    numeric_val = float(str_value)
+                    lines[line_num - 1] = line.replace(f'"{str_value}"', str(numeric_val))
+                except ValueError:
+                    # If non-numeric, use parseDouble
+                    lines[line_num - 1] = line.replace(f'"{str_value}"', f'Double.parseDouble("{str_value}")')
         
         return "\n".join(lines)
 

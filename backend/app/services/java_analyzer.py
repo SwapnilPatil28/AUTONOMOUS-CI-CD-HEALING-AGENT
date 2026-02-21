@@ -244,6 +244,44 @@ class JavaAnalyzerService:
                     "bug_type": "LINTING",
                     "message": f"unused variable '{name}'",
                 })
+
+        # Raw types (no generics) - HashMap, ArrayList, Map, List without <>
+        for idx, line in enumerate(lines, 1):
+            # HashMap/ArrayList/Map/List without generics
+            raw_type_match = re.search(r'\b(HashMap|ArrayList|Map|List|Set|HashSet)\s+(\w+)\s*=\s*new\s+\1\s*\(', line)
+            if raw_type_match and '<' not in line:
+                failures.append({
+                    "file": file_path,
+                    "line_number": idx,
+                    "bug_type": "LINTING",
+                    "message": f"Raw type usage: {raw_type_match.group(1)} should use generics",
+                })
+
+        # Unused empty methods
+        for idx, line in enumerate(lines, 1):
+            method_match = re.match(
+                r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?"
+                r"(?:void|int|String|boolean|double|float|long|char|byte|short)\s+"
+                r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{?\s*$",
+                line,
+            )
+            if method_match:
+                method_name = method_match.group(1)
+                method_end = self._find_method_end(lines, idx - 1)
+                method_body = "\n".join(lines[idx:method_end])
+                
+                # Check if method body is empty (only whitespace, comments, or single closing brace)
+                body_stripped = re.sub(r'//.*|/\*.*?\*/', '', method_body, flags=re.DOTALL).strip()
+                if body_stripped in ('', '}', '{}'):
+                    # Check if method is used anywhere
+                    method_calls = len(re.findall(rf'\b{method_name}\s*\(', source))
+                    if method_calls <= 1:  # Only the definition itself
+                        failures.append({
+                            "file": file_path,
+                            "line_number": idx,
+                            "bug_type": "LINTING",
+                            "message": f"Unused empty method: {method_name}",
+                        })
         
         return failures
 
@@ -506,6 +544,84 @@ class JavaAnalyzerService:
                         "message": "missing tie-check in loop when board is full",
                     })
                     break
+
+        # Infinite recursion detection: binary search with mid not incremented
+        for idx, line in enumerate(lines, 1):
+            # Look for recursive method calls with parameters
+            recursive_call = re.search(r'(\w+)\s*\(([^)]+)\)', line)
+            if recursive_call:
+                method_name = recursive_call.group(1)
+                params = recursive_call.group(2)
+                param_list = [p.strip() for p in params.split(',')]
+                
+                # Check if this is inside a method with same name (recursion)
+                for back_idx in range(max(0, idx - 15), idx):
+                    method_sig = re.search(rf'\b{method_name}\s*\(([^)]+)\)', lines[back_idx])
+                    if method_sig:
+                        # Extract parameter names from method signature
+                        sig_params = method_sig.group(1)
+                        sig_param_names = []
+                        for param in sig_params.split(','):
+                            parts = param.strip().split()
+                            if len(parts) >= 2:
+                                sig_param_names.append(parts[-1])  # Last part is variable name
+                        
+                        # For binary search pattern (4 params: array, target, low, high)
+                        if len(sig_param_names) >= 4 and len(param_list) >= 4:
+                            # Get the middle parameter name (typically 'mid', 'middle', 'center', etc.)
+                            # Find it in the method body
+                            for body_idx in range(back_idx, idx):
+                                mid_calc = re.search(r'\b(\w+)\s*=\s*\([^)]*\+[^)]*\)\s*/\s*2', lines[body_idx])
+                                if mid_calc:
+                                    mid_var = mid_calc.group(1)
+                                    # Check if this mid variable is used as boundary without +/-1
+                                    if mid_var in param_list:
+                                        # Check if used without adjustment
+                                        mid_positions = [i for i, p in enumerate(param_list) if p == mid_var]
+                                        for pos in mid_positions:
+                                            # mid should not be directly used as low or high boundary
+                                            if pos in [2, 3] and not re.search(rf'{mid_var}\s*[+-]\s*1', params):
+                                                failures.append({
+                                                    "file": file_path,
+                                                    "line_number": idx,
+                                                    "bug_type": "LOGIC",
+                                                    "message": "Infinite recursion: mid used as boundary without increment/decrement",
+                                                })
+                                    break
+                        break
+
+        # Inverted rotated array search logic detection
+        for idx, line in enumerate(lines, 1):
+            # Look for rotated array binary search pattern - generic array and variable names
+            # Pattern: if (arr[left] <= arr[mid])
+            array_compare = re.search(r'if\s*\([^)]*(\w+)\s*\[\s*(\w+)\s*\]\s*<=\s*\1\s*\[\s*(\w+)\s*\]', line)
+            if array_compare:
+                array_name = array_compare.group(1)
+                left_var = array_compare.group(2)
+                mid_var = array_compare.group(3)
+                
+                # Look for the condition and assignments in the if block
+                method_start = max(0, idx - 1)
+                method_end = min(len(lines), idx + 15)
+                context_lines = lines[method_start:method_end]
+                context = "\n".join(context_lines)
+                
+                # Look for pattern: if (arr[left] <= target && target < arr[mid]) inside the outer if
+                # This means "target is in sorted left half"
+                # Correct: should reduce right boundary (high = mid - 1)
+                # Inverted: increases left boundary (low = mid + 1) instead
+                inner_if = re.search(
+                    rf'if\s*\([^)]*{array_name}\s*\[\s*{left_var}\s*\]\s*<=\s*(\w+)\s*&&\s*\1\s*<\s*{array_name}\s*\[\s*{mid_var}\s*\][^{{]*\{{[^}}]*{left_var}\s*=',
+                    context
+                )
+                if inner_if:
+                    # Found: target in sorted left, but code increases left (searches right) - INVERTED
+                    failures.append({
+                        "file": file_path,
+                        "line_number": idx,
+                        "bug_type": "LOGIC",
+                        "message": "Inverted rotated array search logic",
+                    })
         
         return failures
 
@@ -578,6 +694,71 @@ class JavaAnalyzerService:
                     "bug_type": "TYPE_ERROR",
                     "message": "Scanner type should be capitalized",
                 })
+
+        # Return type mismatch detection - find method signatures and track their return types
+        method_signatures = []
+        for idx, line in enumerate(lines, 1):
+            sig_match = re.match(
+                r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?"
+                r"(int|String|double|float|long|boolean|void|char|byte|short)\s+"
+                r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:\{|throws\b)",
+                line,
+            )
+            if sig_match:
+                return_type = sig_match.group(1)
+                method_name = sig_match.group(2)
+                method_signatures.append((idx, return_type, method_name))
+
+        # Check return statements within method bodies for type mismatches
+        for method_line, expected_type, method_name in method_signatures:
+            method_end = self._find_method_end(lines, method_line - 1)
+            method_body = "\n".join(lines[method_line - 1:method_end])
+            
+            # Find return statements within this method
+            for body_idx, body_line in enumerate(lines[method_line:method_end], method_line + 1):
+                # int method returning String literal
+                if expected_type == "int" and re.search(r'\breturn\s+"[^"]*"\s*;', body_line):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": body_idx,
+                        "bug_type": "TYPE_ERROR",
+                        "message": f"int method returning String literal",
+                    })
+                
+                # int method returning decimal literal
+                if expected_type == "int" and re.search(r'\breturn\s+-?\d+\.\d+\s*;', body_line):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": body_idx,
+                        "bug_type": "TYPE_ERROR",
+                        "message": f"int method returning decimal literal",
+                    })
+                
+                # String method returning int literal (no quotes)
+                if expected_type == "String" and re.search(r'\breturn\s+-?\d+\s*;', body_line) and not re.search(r'"', body_line):
+                    failures.append({
+                        "file": file_path,
+                        "line_number": body_idx,
+                        "bug_type": "TYPE_ERROR",
+                        "message": f"String method returning int literal",
+                    })
+
+        # Generic type constraint violation (Map<String, Double> receiving String value)
+        for idx, line in enumerate(lines, 1):
+            # Map<String, Double> declaration
+            map_decl = re.search(r'Map<[^,]+,\s*Double>\s+(\w+)\s*=\s*new\s+HashMap', line)
+            if map_decl:
+                map_name = map_decl.group(1)
+                # Look for String literal being put into this map (should be numeric)
+                for scan_idx in range(idx, min(idx + 20, len(lines) + 1)):
+                    put_line = lines[scan_idx - 1]
+                    if re.search(rf'\b{map_name}\.put\s*\([^,]+,\s*"[^"]+"\s*\)', put_line):
+                        failures.append({
+                            "file": file_path,
+                            "line_number": scan_idx,
+                            "bug_type": "TYPE_ERROR",
+                            "message": "Map<String, Double> receiving String value instead of Double",
+                        })
         
         return failures
 
